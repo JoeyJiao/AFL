@@ -27,6 +27,8 @@ cc_binary {
 
   srcs: [
     "afl-fuzz.c",
+    "smart-chunks.c",
+    "smart-utils.c",
   ],
 }
 

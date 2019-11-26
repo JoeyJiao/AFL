@@ -42,6 +42,8 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
+#include "smart-chunks.h"
+#include "smart-utils.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -100,7 +102,9 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *in_bitmap,                 /* Input bitmap                     */
           *doc_path,                  /* Path to documentation dir        */
           *target_path,               /* Path to target binary            */
-          *orig_cmdline;              /* Original command line            */
+          *orig_cmdline,              /* Original command line            */
+          *input_model_file,          /* Input model file                 */
+          *file_extension;            /* Extension of .cur_input          */
 
 EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
 static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
@@ -108,6 +112,8 @@ static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
 EXP_ST u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
+
+static u32 initial_queue_num;
 
 EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
@@ -133,7 +139,13 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
-           fast_cal;                  /* Try to calibrate faster?         */
+           fast_cal,                  /* Try to calibrate faster?         */
+           smart_mode,                /* Smart fuzzing mode               */
+           stacking_mutation_mode,    /* Stacking mutations, mixed normal and higher-order    */
+                                      /* fuzzing mode                     */
+           smart_log_mode,            /* Smart fuzzing log mode           */
+           smart_mutation_limit;      /* Limit the number of applications */
+                                      /* of smart fuzzing mode            */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -227,6 +239,12 @@ static u64 total_bitmap_size,         /* Total bit count for all bitmaps  */
 
 static s32 cpu_core_count;            /* CPU core count                   */
 
+static u8 model_type,                 /* Input Model Type - PEACH */
+          validity_avg;               /* Global average of input validity */
+
+static u64 parsed_inputs;             /* Number of inputs parsed for      */
+                                      /* validity so far                  */
+
 #ifdef HAVE_AFFINITY
 
 static s32 cpu_aff = -1;       	      /* Selected CPU core                */
@@ -247,7 +265,8 @@ struct queue_entry {
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
       favored,                        /* Currently favored?               */
-      fs_redundant;                   /* Marked as redundant in the fs?   */
+      fs_redundant,                   /* Marked as redundant in the fs?   */
+      parsed;                         /* Has parsing been attempted?      */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
       exec_cksum;                     /* Checksum of the execution trace  */
@@ -258,6 +277,13 @@ struct queue_entry {
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
+
+  u8  validity;                       /* Percent validity (0-100)         */
+
+  struct chunk *chunk;
+  struct chunk *cached_chunk;         /* For caching to prevent slow      */
+                                      /* re-parsing of data to get the    */
+                                      /* chunks back                      */
 
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
@@ -311,7 +337,8 @@ enum {
   /* 13 */ STAGE_EXTRAS_UI,
   /* 14 */ STAGE_EXTRAS_AO,
   /* 15 */ STAGE_HAVOC,
-  /* 16 */ STAGE_SPLICE
+  /* 16 */ STAGE_SMART,
+  /* 17 */ STAGE_SPLICE
 };
 
 /* Stage value types */
@@ -333,6 +360,53 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
+/* Input Model Type */
+
+enum {
+  /* 00 */ MODEL_PEACH
+};
+
+/* Check if a program exists */
+int program_exist(const char *pname) {
+  pid_t pid = 0;
+  int pipefd[2];
+  FILE* output;
+  char line[256];
+  int status;
+ 
+  if (pipe(pipefd) < 0) {
+    exit(1);
+  }
+
+  pid = fork();
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], STDOUT_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+    
+    execlp("which", "which", pname, (char*) NULL);
+    exit(1); /* Stop the child process upon failure. */
+  } else {
+    close(pipefd[1]);
+    output = fdopen(pipefd[0], "r");
+    while (fgets(line, sizeof(line), output)) {
+      fprintf(stderr,"\n%s", line);
+			if (strlen(line) > 0) return 1; //the program exists
+    }
+    waitpid(pid, &status, 0);
+  }
+  return 0; //the program does not exist
+}
+
+/* stricmp */
+int stricmp(char const *a, char const *b) {
+  int d;
+  for (;; a++, b++) {
+    d = tolower(*a) - tolower(*b);
+    if (d != 0 || !*a)
+      return d;
+  }
+}
 
 /* Get unix time in milliseconds */
 
@@ -824,10 +898,83 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
+/* Add input structure information to the queue entry */
+
+static void update_input_structure(u8* fname, struct queue_entry* q) {
+  pid_t pid = 0;
+  int pipefd[2];
+  FILE* output;
+  char line[256];
+  int status;
+  u8* ifname;
+  u8* ofname;
+
+  if (model_type == MODEL_PEACH) {
+
+    if (pipe(pipefd) < 0) {
+			PFATAL("AFLSmart cannot create a pipe to communicate with Peach");
+      exit(1);
+    }
+
+    pid = fork();
+    if (pid == 0) {
+      close(pipefd[0]);
+      dup2(pipefd[1], STDOUT_FILENO);
+      dup2(pipefd[1], STDERR_FILENO);
+      ifname = alloc_printf("-inputFilePath=%s", fname);
+      ofname = alloc_printf("-outputFilePath=%s/chunks/%s.repaired", out_dir,
+                            basename(fname));
+      execlp("peach", "peach", "-1", ifname, ofname, input_model_file, (char*) NULL);
+      exit(1); /* Stop the child process upon failure. */
+    } else {
+      close(pipefd[1]);
+      output = fdopen(pipefd[0], "r");
+
+      while (fgets(line, sizeof(line), output)) {
+        /* Extract validity percentage and update the current queue entry. */
+        q->validity = 0;
+        if (!strncmp(line, "ok", 2)) {
+          q->validity = 100;
+          break;
+        } else if (!strncmp(line, "error", 5)) {
+          char *s = line + 5;
+          while (isspace(*s)) { s++; }
+          char *start = s;
+          while (isdigit(*s)) { s++; }
+          *s = '\0';
+          if (s != start) {
+            q->validity = (u8) atoi(start);
+          }
+          break;
+        }
+      }
+
+      waitpid(pid, &status, 0);
+
+      u8* chunks_fname = alloc_printf("%s/chunks/%s.repaired.chunks", out_dir, basename(fname));
+      struct chunk *chunk;
+
+      get_chunks(chunks_fname, &chunk);
+      q->chunk = chunk;
+      q->cached_chunk = copy_chunks(chunk);
+
+      fclose(output);
+      ck_free(chunks_fname);
+    }
+
+  } else {
+    /// NOT SUPPORTED
+    PFATAL("AFLSmart currently only supports Peach models! Please use -w peach option");
+  }
+
+  parsed_inputs++;
+  validity_avg += (s8)(q->validity - validity_avg) / parsed_inputs;
+  q->parsed = 1;
+}
 
 /* Append new test case to the queue. */
 
-static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
+void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
@@ -835,6 +982,10 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  q->validity     = 0;                /* Default validity is 0. */
+  q->parsed       = 0;                /* Structure parsing not attempted. */
+  q->chunk = NULL;
+  q->cached_chunk = NULL;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -873,6 +1024,10 @@ EXP_ST void destroy_queue(void) {
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    if (q->chunk)
+      delete_chunks(q->chunk);
+    if (q->cached_chunk)
+      delete_chunks(q->cached_chunk);
     ck_free(q);
     q = n;
 
@@ -1094,7 +1249,7 @@ static u32 count_non_255_bytes(u8* mem) {
    is hit or not. Called on every new crash or timeout, should be
    reasonably fast. */
 
-static const u8 simplify_lookup[256] = { 
+static const u8 simplify_lookup[256] = {
 
   [0]         = 1,
   [1 ... 255] = 128
@@ -1186,9 +1341,9 @@ EXP_ST void init_count_class16(void) {
 
   u32 b1, b2;
 
-  for (b1 = 0; b1 < 256; b1++) 
+  for (b1 = 0; b1 < 256; b1++)
     for (b2 = 0; b2 < 256; b2++)
-      count_class_lookup16[(b1 << 8) + b2] = 
+      count_class_lookup16[(b1 << 8) + b2] =
         (count_class_lookup8[b1] << 8) |
         count_class_lookup8[b2];
 
@@ -3054,7 +3209,8 @@ static void pivot_inputs(void) {
       u8* use_name = strstr(rsl, ",orig:");
 
       if (use_name) use_name += 6; else use_name = rsl;
-      nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
+      nfn = alloc_printf("%s/queue/id:%06u,time:0,orig:%s", out_dir, id,
+                         use_name);
 
 #else
 
@@ -3095,7 +3251,8 @@ static u8* describe_op(u8 hnb) {
 
   if (syncing_party) {
 
-    sprintf(ret, "sync:%s,src:%06u", syncing_party, syncing_case);
+    sprintf(ret, "sync:%s,src:%06u,time:%llu", syncing_party, syncing_case,
+            (get_cur_time() - start_time));
 
   } else {
 
@@ -3103,6 +3260,8 @@ static u8* describe_op(u8 hnb) {
 
     if (splicing_with >= 0)
       sprintf(ret + strlen(ret), "+%06u", splicing_with);
+
+    sprintf(ret + strlen(ret), ",time:%llu", (get_cur_time() - start_time));
 
     sprintf(ret + strlen(ret), ",op:%s", stage_short);
 
@@ -3901,9 +4060,24 @@ static void maybe_delete_out_dir(void) {
   if (delete_files(fn, CASE_PREFIX)) goto dir_cleanup_failed;
   ck_free(fn);
 
+  /* Delete Chunks. */
+
+  fn = alloc_printf("%s/chunks", out_dir);
+  if (delete_files(fn, "")) goto dir_cleanup_failed;
+  ck_free(fn);
+
   /* And now, for some finishing touches. */
 
+  if (file_extension) {
+
+    fn = alloc_printf("%s/.cur_input.%s", out_dir, file_extension);
+
+  } else {
+
   fn = alloc_printf("%s/.cur_input", out_dir);
+
+  }
+
   if (unlink(fn) && errno != ENOENT) goto dir_cleanup_failed;
   ck_free(fn);
 
@@ -4322,8 +4496,9 @@ static void show_stats(void) {
        "  imported : " cRST "%-10s " bSTG bV "\n", tmp,
        sync_id ? DI(queued_imported) : (u8*)"n/a");
 
-  sprintf(tmp, "%s/%s, %s/%s",
+  sprintf(tmp, "%s/%s, %s/%s, %s/%s",
           DI(stage_finds[STAGE_HAVOC]), DI(stage_cycles[STAGE_HAVOC]),
+          DI(stage_finds[STAGE_SMART]), DI(stage_cycles[STAGE_SMART]),
           DI(stage_finds[STAGE_SPLICE]), DI(stage_cycles[STAGE_SPLICE]));
 
   SAYF(bV bSTOP "       havoc : " cRST "%-37s " bSTG bV bSTOP, tmp);
@@ -4824,6 +4999,12 @@ static u32 calculate_score(struct queue_entry* q) {
 
   if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
 
+  /* Take validity into account */
+  if (smart_mode && ((q->parsed && q->validity >= 50) ||
+                     (!q->parsed && validity_avg >= 50))) {
+    perf_score *= 2;
+  }
+
   return perf_score;
 
 }
@@ -5014,6 +5195,785 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
 
 }
 
+struct worklist {
+  struct chunk *chunk;
+  struct worklist *next;
+};
+
+/* Get all data chunks of a specific type -- based on the hierarchal representation of the seeds 
+Type is the hashcode of the chunk type*/
+
+struct worklist *get_chunks_of_type_recursively(struct chunk *c, int type,
+                                                u32 len, int *number,
+                                                struct worklist *tail) {
+  struct chunk *sibling = c;
+
+  while (sibling) {
+    int chunk_len = sibling->end_byte - sibling->start_byte + 1;
+    struct worklist *tmp = get_chunks_of_type_recursively(
+        sibling->children, type, len, number, tail);
+
+    /* We require chunk of the same type and not of bigger size. */
+    if (sibling->start_byte >= 0 && sibling->end_byte >= 0 && chunk_len > 0 &&
+        chunk_len <= len && sibling->type == type) {
+
+      tail = (struct worklist *)malloc(sizeof(struct worklist));
+      tail->chunk = sibling;
+      tail->next = tmp;
+      (*number)++;
+    } else {
+      tail = tmp;
+    }
+    sibling = sibling->next;
+  }
+
+  return tail;
+}
+
+/* Get all data chunks of a specific type -- based on the hierarchal representation of the seeds 
+Type is the hashcode of the chunk type*/
+
+struct worklist *get_chunks_of_type(struct chunk *c, int type, u32 len,
+                                    int *number) {
+  (*number) = 0;
+  return get_chunks_of_type_recursively(c, type, len, number, NULL);
+}
+
+
+struct chunk *get_chunk_of_type_with_children(struct chunk *c, int type) {
+  if (c == NULL)
+    return NULL;
+
+  if (c->type == type && c->children != NULL)
+    return c;
+
+  struct chunk *d = get_chunk_of_type_with_children(c->next, type);
+  if (d != NULL)
+    return d;
+
+  return get_chunk_of_type_with_children(c->children, type);
+}
+
+#define LINEARIZATION_UNIT 8
+
+int add_chunk_to_array(struct chunk *c, struct chunk ***chunks_arr,
+                       u32 *chunks_number) {
+  if ((*chunks_number) % (1 << LINEARIZATION_UNIT) == 0 && *chunks_number > 0) {
+    size_t new_size = (((*chunks_number) >> LINEARIZATION_UNIT) + 1)
+                      << LINEARIZATION_UNIT;
+    *chunks_arr = (struct chunk **)realloc(*chunks_arr,
+                                           new_size * sizeof(struct chunk *));
+    if (*chunks_arr == NULL)
+      return -1; /* Return error */
+  }
+  (*chunks_arr)[*chunks_number] = c;
+
+  (*chunks_number)++;
+  return 0;
+}
+
+void linearize_chunks_recursively(
+    u32 first_level, u32 second_level, struct chunk *c,
+    struct chunk ***first_chunks_arr, struct chunk ***second_chunks_arr,
+    struct chunk ***deeper_chunks_arr, u32 *first_chunks_number,
+    u32 *second_chunks_number, u32 *deeper_chunks_number, u32 depth) {
+  struct chunk *sibling = c;
+
+  while (sibling) {
+    linearize_chunks_recursively(
+        first_level, second_level, sibling->children, first_chunks_arr,
+        second_chunks_arr, deeper_chunks_arr, first_chunks_number,
+        second_chunks_number, deeper_chunks_number, depth + 1);
+
+    if (depth == first_level) {
+      if (add_chunk_to_array(sibling, first_chunks_arr, first_chunks_number))
+        return;
+    } else if (depth == second_level) {
+      if (add_chunk_to_array(sibling, second_chunks_arr, second_chunks_number))
+        return;
+    } else if (depth > second_level) {
+      if (add_chunk_to_array(sibling, deeper_chunks_arr, deeper_chunks_number))
+        return;
+    }
+    sibling = sibling->next;
+  }
+}
+
+void linearize_chunks(struct chunk *c, struct chunk ***first_chunks_arr,
+                      struct chunk ***second_chunks_arr,
+                      struct chunk ***deeper_chunks_arr,
+                      u32 *first_chunks_number, u32 *second_chunks_number,
+                      u32 *deeper_chunks_number) {
+  u32 first_level = 0, second_level;
+
+  *first_chunks_number = 0;
+  *second_chunks_number = 0;
+  *deeper_chunks_number = 0;
+  *first_chunks_arr = (struct chunk **)malloc((1 << LINEARIZATION_UNIT) *
+                                              sizeof(struct chunk *));
+  *second_chunks_arr = (struct chunk **)malloc((1 << LINEARIZATION_UNIT) *
+                                               sizeof(struct chunk *));
+  *deeper_chunks_arr = (struct chunk **)malloc((1 << LINEARIZATION_UNIT) *
+                                               sizeof(struct chunk *));
+  if (model_type == MODEL_PEACH) {
+    first_level = 1;
+  } 
+
+  second_level = first_level + 1;
+
+  linearize_chunks_recursively(first_level, second_level, c, first_chunks_arr,
+                               second_chunks_arr, deeper_chunks_arr,
+                               first_chunks_number, second_chunks_number,
+                               deeper_chunks_number, 0);
+}
+
+struct chunk *copy_children_with_new_offset(int new_start_byte,
+                                            int old_start_byte,
+                                            struct chunk *c) {
+  struct chunk *sibling = c;
+  struct chunk *ret = NULL;
+
+  while (sibling) {
+    struct chunk *children = copy_children_with_new_offset(
+        new_start_byte, old_start_byte, sibling->children);
+
+    struct chunk *new = (struct chunk *)malloc(sizeof(struct chunk));
+    new->id = sibling->id;
+    new->type = sibling->type;
+    new->start_byte = (sibling->start_byte - old_start_byte) + new_start_byte;
+    new->end_byte = (sibling->end_byte - old_start_byte) + new_start_byte;
+    new->modifiable = sibling->modifiable;
+    new->next = ret;
+    new->children = children;
+    ret = new;
+
+    sibling = sibling->next;
+  }
+
+  return ret;
+}
+
+struct chunk *get_chunk_to_delete(struct chunk **chunks_array, u32 total_chunks,
+                                  u32 *del_from, u32 *del_len) {
+  struct chunk *chunk_to_delete = NULL;
+  u8 i;
+
+  *del_from = 0;
+  *del_len = 0;
+
+  for (i = 0; i < 3; ++i) {
+    int start_byte;
+    u32 chunk_id = UR(total_chunks);
+
+    chunk_to_delete = chunks_array[chunk_id];
+    start_byte = chunk_to_delete->start_byte;
+
+    /* It is possible that either the start or the end bytes are
+       unknown (has negative values), so we actually perform the
+       deletion only when these bounds are known. */
+    if (start_byte >= 0 &&
+        chunk_to_delete->end_byte >= start_byte) {
+      /* Note that the length to be deleted here is 1 more than
+         end_byte - start_byte, since the end_byte is exactly the
+         position of the last byte, not one more than the last
+         byte. */
+      *del_from = start_byte;
+      *del_len = chunk_to_delete->end_byte - start_byte + 1;
+      break;
+    }
+  }
+
+  return chunk_to_delete;
+}
+
+struct chunk *get_target_to_splice(struct chunk **chunks_array,
+                                   u32 total_chunks, int *target_start_byte,
+                                   u32 *target_len, u32 *type) {
+  struct chunk *target_chunk = NULL;
+  u8 i;
+
+  *target_start_byte = 0;
+  *target_len = 0;
+  *type = 0;
+
+  for (i = 0; i < 3; ++i) {
+    u32 chunk_id = UR(total_chunks);
+    target_chunk = chunks_array[chunk_id];
+    *target_start_byte = target_chunk->start_byte;
+
+    if (*target_start_byte >= 0 &&
+        target_chunk->end_byte >= *target_start_byte) {
+      *target_len = target_chunk->end_byte - *target_start_byte + 1;
+      *type = target_chunk->type;
+      break;
+    }
+  }
+
+  return target_chunk;
+}
+
+struct chunk *get_parent_to_insert_child(struct chunk **chunks_array,
+                                         u32 total_chunks,
+                                         int *target_start_byte,
+                                         u32 *target_len, u32 *type) {
+  struct chunk *target_parent_chunk = NULL;
+
+  *target_start_byte = 0;
+  *target_len = 0;
+  *type = 0;
+
+  for (u8 i = 0; i < 3; ++i) {
+    u32 chunk_id = UR(total_chunks);
+    target_parent_chunk = chunks_array[chunk_id];
+    *target_start_byte = target_parent_chunk->start_byte;
+    if (*target_start_byte >= 0 &&
+        target_parent_chunk->end_byte >= *target_start_byte &&
+        target_parent_chunk->children != NULL) {
+      *target_len = target_parent_chunk->end_byte - *target_start_byte + 1;
+      *type = target_parent_chunk->type;
+      break;
+    }
+  }
+
+  return target_parent_chunk;
+}
+
+/*
+ * Parameters:
+ *
+ * temp_len: Pointer to the length of out_buf.
+ *
+ * out_buf: The output buffer.
+ */
+u8 higher_order_fuzzing(struct queue_entry *current_queue_entry, s32 *temp_len,
+                        u8 **out_buf, s32 alloc_size) {
+  u8 changed_structure = 0;
+
+  if (!current_queue_entry || !current_queue_entry->chunk)
+    return changed_structure;
+
+  struct chunk *current_chunk = current_queue_entry->chunk;
+
+    u32 r = UR(12);
+    u32 s = 3;
+
+    if (model_type == MODEL_PEACH) {
+      if (r <= 5) {
+        if (r <= 1) {
+          s = 0;
+        } else if (r <= 3) {
+          s = 1;
+        } else {
+          s = 2;
+        }
+      }
+    } 
+
+    switch (s) {
+
+    /* 50% chance of no higher-order mutation */
+    case 3 ... 5:
+      break;
+
+    case 0: { /* Delete chunk */
+      u32 del_from, del_len;
+      struct chunk **first_chunks_array = NULL;
+      struct chunk **second_chunks_array = NULL;
+      struct chunk **deeper_chunks_array = NULL;
+      u32 total_first_chunks = 0;
+      u32 total_second_chunks = 0;
+      u32 total_deeper_chunks = 0;
+
+      if (*temp_len < 2)
+        break;
+
+      del_from = del_len = 0;
+
+      linearize_chunks(current_chunk, &first_chunks_array, &second_chunks_array,
+                       &deeper_chunks_array, &total_first_chunks,
+                       &total_second_chunks, &total_deeper_chunks);
+
+      if (total_first_chunks <= 0) {
+        if (first_chunks_array != NULL)
+          free(first_chunks_array);
+
+        if (second_chunks_array != NULL)
+          free(second_chunks_array);
+
+        if (deeper_chunks_array != NULL)
+          free(deeper_chunks_array);
+
+        break;
+      }
+
+      struct chunk *chunk_to_delete = NULL;
+
+      /* Make sure we initialize */
+      del_len = 0;
+
+      if (total_first_chunks > 1)
+        chunk_to_delete = get_chunk_to_delete(
+            first_chunks_array, total_first_chunks, &del_from, &del_len);
+
+      if (first_chunks_array != NULL)
+        free(first_chunks_array);
+
+      /* If chunk not found, we try the second-level chunks */
+      if (del_len == 0 && total_second_chunks > 1) {
+        chunk_to_delete = get_chunk_to_delete(
+            second_chunks_array, total_second_chunks, &del_from, &del_len);
+      }
+
+      if (second_chunks_array != NULL)
+        free(second_chunks_array);
+
+      /* If chunk not found, we try the deeper-level chunks */
+      if (del_len == 0 && total_deeper_chunks > 1) {
+        chunk_to_delete = get_chunk_to_delete(
+            deeper_chunks_array, total_deeper_chunks, &del_from, &del_len);
+      }
+
+      if (deeper_chunks_array != NULL)
+        free(deeper_chunks_array);
+
+      if (del_len != 0 && del_len < *temp_len) {
+        if (smart_log_mode) {
+          smart_log("BEFORE DELETION:\n");
+          if (model_type == MODEL_PEACH)
+            smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+
+          smart_log("DELETED CHUNK:\n");
+          smart_log("Type: %d Start: %d End: %d Modifiable: %d\n",
+                    chunk_to_delete->type, chunk_to_delete->start_byte,
+                    chunk_to_delete->end_byte, chunk_to_delete->modifiable);
+          if (model_type == MODEL_PEACH)
+            smart_log_n_hex(del_len, (*out_buf) + del_from);
+        }
+
+        memmove((*out_buf) + del_from, (*out_buf) + del_from + del_len,
+                (*temp_len) - del_from - del_len + 1);
+        (*temp_len) -= del_len;
+        current_queue_entry->chunk = search_and_destroy_chunk(
+            current_queue_entry->chunk, chunk_to_delete, del_from, del_len);
+        changed_structure = 1;
+
+        if (smart_log_mode) {
+          smart_log("AFTER DELETION:\n");
+          if (model_type == MODEL_PEACH)
+            smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+        }
+      }
+      break;
+    }
+
+    case 1: { /* Splice chunk */
+      struct queue_entry *source_entry;
+      u32 tid;
+      u8 attempts = 20;
+      u32 type, target_len;
+      u32 smart_splicing_with = -1;
+      int target_start_byte = 0;
+      int source_start_byte = 0;
+      struct worklist *source;
+      struct chunk **first_chunks_array = NULL;
+      struct chunk **second_chunks_array = NULL;
+      struct chunk **deeper_chunks_array = NULL;
+      u32 total_first_chunks = 0;
+      u32 total_second_chunks = 0;
+      u32 total_deeper_chunks = 0;
+
+      do {
+        tid = UR(queued_paths);
+        smart_splicing_with = tid;
+        source_entry = queue;
+
+        while (tid >= 100) {
+          source_entry = source_entry->next_100;
+          tid -= 100;
+        }
+        while (tid--)
+          source_entry = source_entry->next;
+
+        while (source_entry &&
+               (!source_entry->chunk || source_entry == current_queue_entry)) {
+          source_entry = source_entry->next;
+          smart_splicing_with++;
+        }
+        attempts--;
+
+      } while (!source_entry && attempts);
+
+      if (attempts == 0)
+        break;
+
+      type = target_len = 0;
+      linearize_chunks(current_chunk, &first_chunks_array, &second_chunks_array,
+                       &deeper_chunks_array, &total_first_chunks,
+                       &total_second_chunks, &total_deeper_chunks);
+
+      if (total_first_chunks <= 0) {
+
+        if (first_chunks_array != NULL)
+          free(first_chunks_array);
+
+        if (second_chunks_array != NULL)
+          free(second_chunks_array);
+
+        if (deeper_chunks_array != NULL)
+          free(deeper_chunks_array);
+
+        break;
+      }
+
+      struct chunk *target_chunk =
+          get_target_to_splice(first_chunks_array, total_first_chunks,
+                               &target_start_byte, &target_len, &type);
+
+      if (first_chunks_array != NULL)
+        free(first_chunks_array);
+
+      if (target_len <= 0 && total_second_chunks > 0) {
+        target_chunk =
+            get_target_to_splice(second_chunks_array, total_second_chunks,
+                                 &target_start_byte, &target_len, &type);
+      }
+
+      if (second_chunks_array != NULL)
+        free(second_chunks_array);
+
+      if (target_len <= 0 && total_deeper_chunks > 0) {
+        target_chunk =
+            get_target_to_splice(deeper_chunks_array, total_deeper_chunks,
+                                 &target_start_byte, &target_len, &type);
+      }
+
+      if (deeper_chunks_array != NULL)
+        free(deeper_chunks_array);
+
+      /* We only splice chunks of known bounds */
+      if (target_len > 0) {
+        struct worklist *source_init;
+        int same_type_chunks_num = 0;
+        u32 source_len = 0;
+
+        /* Find same type and non-bigger size in source */
+        source = get_chunks_of_type(source_entry->chunk, type, target_len,
+                                    &same_type_chunks_num);
+        source_init = source;
+
+        if (source != NULL && same_type_chunks_num > 0) {
+          /* Insert source chunk into out_buf. */
+          u32 chunk_id = UR(same_type_chunks_num);
+
+          source_len = 0;
+          while (source) {
+            if (chunk_id == 0) {
+              source_start_byte = source->chunk->start_byte;
+              if (source_start_byte >= 0 &&
+                  source->chunk->end_byte >= source_start_byte) {
+                source_len = source->chunk->end_byte - source_start_byte + 1;
+              }
+              break;
+            }
+
+            chunk_id--;
+            source = source->next;
+          }
+
+          if (source != NULL && source->chunk != NULL && source_len > 0 &&
+              (*temp_len) - target_start_byte - target_len + 1 >= 0) {
+            s32 fd;
+            u8 *source_buf;
+
+            /* Read the testcase into a new buffer. */
+
+            fd = open(source_entry->fname, O_RDONLY);
+
+            if (fd < 0)
+              PFATAL("Unable to open '%s'", source_entry->fname);
+
+            source_buf = ck_alloc_nozero(source_entry->len);
+
+            ck_read(fd, source_buf, source_entry->len, source_entry->fname);
+
+            close(fd);
+
+            /* Apply the splicing to the output buffer */
+            u32 move_amount = target_len - source_len;
+
+            if (smart_log_mode) {
+              smart_log("BEFORE SPLICING:\n");
+              if (model_type == MODEL_PEACH)
+                smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+
+              smart_log("TARGET CHUNK:\n");
+              smart_log("Type: %d Start: %d End: %d Modifiable: %d\n",
+                        target_chunk->type, target_chunk->start_byte,
+                        target_chunk->end_byte, target_chunk->modifiable);
+              if (model_type == MODEL_PEACH)
+                smart_log_n_hex(target_len, (*out_buf) + target_start_byte);
+
+              smart_log("SOURCE CHUNK:\n");
+              smart_log("Type: %d Start: %d End: %d Modifiable: %d\n",
+                source->chunk->type, source->chunk->start_byte,
+                source->chunk->end_byte, source->chunk->modifiable);
+              if (model_type == MODEL_PEACH)
+                smart_log_n_hex(source_len, source_buf + source_start_byte);
+            }
+
+            memcpy((*out_buf) + target_start_byte,
+                   source_buf + source_start_byte, source_len);
+
+            memmove((*out_buf) + target_start_byte + source_len,
+                    (*out_buf) + target_start_byte + target_len,
+                    (*temp_len) - target_start_byte - target_len + 1);
+
+            (*temp_len) -= move_amount;
+
+            struct chunk *target_next = target_chunk->next;
+            unsigned long target_id = target_chunk->id;
+            delete_chunks(target_chunk->children);
+            target_chunk->children = NULL;
+            reduce_byte_positions(current_queue_entry->chunk, target_start_byte,
+                                  move_amount);
+
+            memcpy(target_chunk, source->chunk, sizeof(struct chunk));
+            target_chunk->id = target_id;
+            target_chunk->start_byte = target_start_byte;
+            target_chunk->end_byte = target_start_byte + source_len - 1;
+            target_chunk->next = target_next;
+            target_chunk->children = copy_children_with_new_offset(
+                target_start_byte, source->chunk->start_byte,
+                source->chunk->children);
+            changed_structure = 1;
+
+            /* The source buffer is no longer needed */
+            ck_free(source_buf);
+
+            if (smart_log_mode) {
+              smart_log("AFTER SPLICING:\n");
+              if (model_type == MODEL_PEACH)
+                smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+            }
+          }
+        }
+
+        /* Free source linked list. */
+        while (source_init) {
+          struct worklist *next = source_init->next;
+          free(source_init);
+          source_init = next;
+        }
+      }
+
+      break;
+    }
+    case 2: { /* Adopt a child from a chunk of the same type */
+      struct queue_entry *source_entry;
+      u32 tid;
+      u8 attempts = 20;
+      u32 type, target_len;
+      int target_start_byte = 0;
+
+      struct chunk *source_parent_chunk = NULL;
+      struct chunk **first_chunks_array = NULL;
+      struct chunk **second_chunks_array = NULL;
+      struct chunk **deeper_chunks_array = NULL;
+      u32 first_total_chunks;
+      u32 second_total_chunks;
+      u32 deeper_total_chunks;
+
+      type = target_len = 0;
+      linearize_chunks(current_chunk, &first_chunks_array, &second_chunks_array,
+                       &deeper_chunks_array, &first_total_chunks,
+                       &second_total_chunks, &deeper_total_chunks);
+
+      if (first_total_chunks <= 0) {
+
+        if (first_chunks_array != NULL)
+          free(first_chunks_array);
+
+        if (second_chunks_array != NULL)
+          free(second_chunks_array);
+
+        if (deeper_chunks_array != NULL)
+          free(deeper_chunks_array);
+
+        break;
+      }
+
+      struct chunk *target_parent_chunk =
+          get_parent_to_insert_child(first_chunks_array, first_total_chunks,
+                                     &target_start_byte, &target_len, &type);
+
+      if (first_chunks_array != NULL)
+        free(first_chunks_array);
+
+      if (target_len <= 0 && second_total_chunks > 0) {
+        target_parent_chunk =
+            get_parent_to_insert_child(second_chunks_array, second_total_chunks,
+                                       &target_start_byte, &target_len, &type);
+      }
+
+      if (second_chunks_array != NULL)
+        free(second_chunks_array);
+
+      if (target_len <= 0 && deeper_total_chunks > 0) {
+        target_parent_chunk =
+            get_parent_to_insert_child(deeper_chunks_array, deeper_total_chunks,
+                                       &target_start_byte, &target_len, &type);
+      }
+
+      if (deeper_chunks_array != NULL)
+        free(deeper_chunks_array);
+
+      if (target_len > 0) {
+        do {
+          tid = UR(queued_paths);
+          source_entry = queue;
+
+          while (tid >= 100) {
+            source_entry = source_entry->next_100;
+            tid -= 100;
+          }
+          while (tid--)
+            source_entry = source_entry->next;
+
+          while (source_entry && (!source_entry->chunk ||
+            source_entry == current_queue_entry)) {
+            source_entry = source_entry->next;
+          }
+          attempts--;
+
+        } while (!source_entry && attempts);
+
+        if (source_entry) {
+          source_parent_chunk =
+              get_chunk_of_type_with_children(source_entry->chunk, type);
+          if (source_parent_chunk != NULL) {
+            /* We adopt only one of the children. */
+            s32 fd;
+            u8 *source_buf;
+            struct chunk *source_child_chunk = source_parent_chunk->children;
+            u8 retry = 20;
+
+            while (retry > 0) {
+              u32 num_children = 0;
+              u32 source_child_id;
+
+              source_child_chunk = source_parent_chunk->children;
+              while (source_child_chunk) {
+                source_child_chunk = source_child_chunk->next;
+                num_children++;
+              }
+
+              source_child_id = UR(num_children);
+              source_child_chunk = source_parent_chunk->children;
+              while (source_child_id > 0) {
+                source_child_chunk = source_child_chunk->next;
+                source_child_id--;
+              }
+
+              if (source_child_chunk->start_byte > 0 &&
+                  source_child_chunk->end_byte >=
+                      source_child_chunk->start_byte) {
+                break;
+              } else if (num_children == 1) {
+                retry = 0;
+              } else {
+                retry--;
+              }
+            }
+
+            if (retry > 0) {
+              /* Add more storage in out_buf for the adopted child chunk */
+              size_t source_child_chunk_size = source_child_chunk->end_byte -
+                                               source_child_chunk->start_byte +
+                                               1;
+              size_t new_size = *temp_len + source_child_chunk_size;
+
+              if (new_size > alloc_size)
+                *out_buf = ck_realloc((*out_buf), new_size);
+
+              /* Read the testcase into a new buffer. */
+
+              fd = open(source_entry->fname, O_RDONLY);
+
+              if (fd < 0)
+                PFATAL("Unable to open '%s'", source_entry->fname);
+
+              source_buf = ck_alloc_nozero(source_entry->len);
+
+              ck_read(fd, source_buf, source_entry->len, source_entry->fname);
+
+              close(fd);
+
+              /* Logging */
+              if (smart_log_mode) {
+                smart_log("BEFORE ADOPTING:\n");
+                if (model_type == MODEL_PEACH)
+                  smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+                
+                smart_log("SOURCE CHUNK:\n");
+                if (model_type == MODEL_PEACH)
+                  smart_log_n_hex(source_child_chunk_size, source_buf + source_child_chunk->start_byte);
+              }
+
+              /* Move the data around */
+              if (target_parent_chunk->end_byte + 1 < *temp_len) {
+                memmove((*out_buf) + target_parent_chunk->end_byte +
+                            source_child_chunk_size + 1,
+                        (*out_buf) + target_parent_chunk->end_byte + 1,
+                        *temp_len - (target_parent_chunk->end_byte + 1));
+              }
+              memcpy((*out_buf) + target_parent_chunk->end_byte + 1,
+                     source_buf + source_child_chunk->start_byte,
+                     source_child_chunk_size);
+
+              *temp_len += source_child_chunk_size;
+
+              int target_parent_end_byte = target_parent_chunk->end_byte;
+
+              /* Update the chunks */
+              increase_byte_positions_except_target_children(
+                  current_queue_entry->chunk, target_parent_chunk,
+                  target_start_byte, source_child_chunk_size);
+
+              /* Create new chunk node */
+              struct chunk *new_child_chunk =
+                  (struct chunk *)malloc(sizeof(struct chunk));
+              new_child_chunk->id = (unsigned long)new_child_chunk;
+              new_child_chunk->type = source_child_chunk->type;
+              new_child_chunk->start_byte = target_parent_end_byte + 1;
+              new_child_chunk->end_byte =
+                  target_parent_end_byte + source_child_chunk_size;
+              new_child_chunk->modifiable = source_child_chunk->modifiable;
+              new_child_chunk->next = target_parent_chunk->children;
+              new_child_chunk->children = copy_children_with_new_offset(
+                  new_child_chunk->start_byte, source_child_chunk->start_byte,
+                  source_child_chunk->children);
+              target_parent_chunk->children = new_child_chunk;
+
+              /* Flag that we have changed the structure */
+              changed_structure = 1;
+
+              /* Free the source buffer */
+              ck_free(source_buf);
+
+              if (smart_log_mode) {
+                smart_log("AFTER ADOPTING:\n");
+                if (model_type == MODEL_PEACH)
+                  smart_log_tree_with_data_hex(current_queue_entry->chunk, (*out_buf));
+              }
+            }
+          }
+        }
+      }
+      break;
+    }
+    }
+    return changed_structure;
+}
 
 /* Take the current entry from the queue, fuzz it for a while. This
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
@@ -5123,11 +6083,18 @@ static u8 fuzz_one(char** argv) {
 
   }
 
+  /* Deferred cracking */
+  if (smart_mode && !queue_cur->chunk && (initial_queue_num > 0
+      || UR(100) < (get_cur_time() - last_path_time) / 50)) {
+    update_input_structure(queue_cur->fname, queue_cur);
+    --initial_queue_num;
+  }
+
   /************
    * TRIMMING *
    ************/
 
-  if (!dumb_mode && !queue_cur->trim_done) {
+  if (!smart_mode && !dumb_mode && !queue_cur->trim_done) {
 
     u8 res = trim_case(argv, queue_cur, in_buf);
 
@@ -6167,15 +7134,36 @@ havoc_stage:
   /* We essentially just do several thousand runs (depending on perf_score)
      where we take the input file and make random stacked tweaks. */
 
+  u8 has_smart_mut;
+  s32 smart_results = 0, smart_runs = 0;
+
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
     u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
+    u8 changed_size = 0;
+    u32 higher_order_changed_size = 0;
 
     stage_cur_val = use_stacking;
+    has_smart_mut = 0;
  
+    if (smart_mode && !stacking_mutation_mode && !splice_cycle && queue_cur->chunk) {
     for (i = 0; i < use_stacking; i++) {
+        if (smart_mutation_limit == 0 || higher_order_changed_size < smart_mutation_limit) {
+          u8 changed_structure =
+              higher_order_fuzzing(queue_cur, &temp_len, &out_buf, len);
+          if (changed_structure)
+            higher_order_changed_size++;
+          has_smart_mut = 1;
+        }
+      }
+      goto fuzz_one_common_fuzz_call;
+    }
 
-      switch (UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
+    for (i = 0; i < use_stacking; i++) {
+      u8 base_mutation_count =
+          (smart_mode && stacking_mutation_mode && !changed_size ? 16 : 15);
+
+      switch (UR(base_mutation_count + ((extras_cnt + a_extras_cnt) ? 2 : 0))) {
 
         case 0:
 
@@ -6370,6 +7358,7 @@ havoc_stage:
                     temp_len - del_from - del_len);
 
             temp_len -= del_len;
+            changed_size = 1;
 
             break;
 
@@ -6420,7 +7409,7 @@ havoc_stage:
             ck_free(out_buf);
             out_buf = new_buf;
             temp_len += clone_len;
-
+            changed_size = 1;
           }
 
           break;
@@ -6451,15 +7440,33 @@ havoc_stage:
 
           }
 
+        case 15: {
+          if (!smart_mode || !stacking_mutation_mode || splice_cycle || !queue_cur->chunk || changed_size)
+            goto first_optional_mutation;
+
+          if (smart_mutation_limit == 0 || higher_order_changed_size < smart_mutation_limit) {
+            u8 changed_structure =
+                higher_order_fuzzing(queue_cur, &temp_len, &out_buf, len);
+            if (changed_structure)
+              higher_order_changed_size++;
+            has_smart_mut = 1;
+          }
+          break;
+        }
+
         /* Values 15 and 16 can be selected only if there are any extras
            present in the dictionaries. */
 
-        case 15: {
+        case 16: {
+          if (!smart_mode || !stacking_mutation_mode || changed_size)
+            goto second_optional_mutation;
+
+first_optional_mutation:
 
             /* Overwrite bytes with an extra. */
 
             if (!extras_cnt || (a_extras_cnt && UR(2))) {
-
+              if (!a_extras_cnt) break;
               /* No user-specified extras or odds in our favor. Let's use an
                  auto-detected one. */
 
@@ -6473,7 +7480,7 @@ havoc_stage:
               memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
 
             } else {
-
+              if(!extras_cnt) break;
               /* No auto extras or odds in our favor. Use the dictionary. */
 
               u32 use_extra = UR(extras_cnt);
@@ -6491,10 +7498,13 @@ havoc_stage:
 
           }
 
-        case 16: {
-
-            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
+        case 17: {
+            u32 use_extra, extra_len, insert_at;
             u8* new_buf;
+
+second_optional_mutation:
+
+            insert_at = UR(temp_len + 1);
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
                previous case. */
@@ -6538,22 +7548,74 @@ havoc_stage:
             ck_free(out_buf);
             out_buf   = new_buf;
             temp_len += extra_len;
-
+            changed_size = 1;
             break;
 
           }
 
+        }
+
       }
 
+  fuzz_one_common_fuzz_call:
+
+    if (smart_mode && has_smart_mut) {
+      if (!splice_cycle) {
+
+        stage_name = "havoc-smart";
+        stage_short = "havoc-smart";
+
+      } else {
+
+        static u8 tmp[32];
+
+        sprintf(tmp, "splice-smart %u", splice_cycle);
+        stage_name = tmp;
+        stage_short = "splice-smart";
     }
+    } else {
+      if (!splice_cycle) {
+
+        stage_name = "havoc";
+        stage_short = "havoc";
+
+      } else {
+
+        static u8 tmp[32];
+
+        sprintf(tmp, "splice %u", splice_cycle);
+        stage_name = tmp;
+        stage_short = "splice";
+      }
+    }
+    
+    s32 tmp_hit_cnt = queued_paths + unique_crashes;
 
     if (common_fuzz_stuff(argv, out_buf, temp_len))
       goto abandon_entry;
 
+    if (has_smart_mut) {
+
+      if (tmp_hit_cnt != queued_paths + unique_crashes)
+        smart_results += (queued_paths + unique_crashes) - tmp_hit_cnt;
+      smart_runs += 1;
+
+    }
+
     /* out_buf might have been mangled a bit, so let's restore it to its
        original size and shape. */
 
-    if (temp_len < len) out_buf = ck_realloc(out_buf, len);
+    if (temp_len != len) {
+      out_buf = ck_realloc(out_buf, len);
+    }
+
+    if (smart_mode && higher_order_changed_size > 0) {
+      delete_chunks(queue_cur->chunk);
+
+      /* We restore the chunks to the original state */
+      queue_cur->chunk = copy_chunks(queue_cur->cached_chunk);
+    }
+
     temp_len = len;
     memcpy(out_buf, in_buf, len);
 
@@ -6576,8 +7638,10 @@ havoc_stage:
   new_hit_cnt = queued_paths + unique_crashes;
 
   if (!splice_cycle) {
-    stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt;
-    stage_cycles[STAGE_HAVOC] += stage_max;
+    stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt - smart_results;
+    stage_cycles[STAGE_HAVOC] += stage_max - smart_runs;
+    stage_finds[STAGE_SMART]  += smart_results;
+    stage_cycles[STAGE_SMART] += smart_runs;
   } else {
     stage_finds[STAGE_SPLICE]  += new_hit_cnt - orig_hit_cnt;
     stage_cycles[STAGE_SPLICE] += stage_max;
@@ -7151,6 +8215,14 @@ static void usage(u8* argv0) {
        "  -M / -S id    - distributed mode (see parallel_fuzzing.txt)\n"
        "  -C            - crash exploration mode (the peruvian rabbit thing)\n\n"
 
+       "Smart Fuzzing:\n\n"
+
+       "  -w model_type - type of input model - only peach is supported now \n"
+       "  -g input_model- path to input model file \n"
+       "  -h            - mix higher-order mutations with other mutations\n"
+       "  -l            - log input model mutations in log/<pid>.log of the output directory\n"
+       "  -H number     - Apply a maximum on the number of higher-order mutations\n\n"
+
        "For additional tips, please consult %s/README.\n\n",
 
        argv0, EXEC_TIMEOUT, MEM_LIMIT, doc_path);
@@ -7257,6 +8329,12 @@ EXP_ST void setup_dirs_fds(void) {
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
 
+  /* All chunks and repaired files. */
+
+  tmp = alloc_printf("%s/chunks", out_dir);
+  if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
   /* Generally useful file descriptors. */
 
   dev_null_fd = open("/dev/null", O_RDWR);
@@ -7287,7 +8365,16 @@ EXP_ST void setup_dirs_fds(void) {
 
 EXP_ST void setup_stdio_file(void) {
 
-  u8* fn = alloc_printf("%s/.cur_input", out_dir);
+  u8* fn;
+  if (file_extension) {
+
+    fn = alloc_printf("%s/.cur_input.%s", out_dir, file_extension);
+
+  } else {
+
+    fn = alloc_printf("%s/.cur_input", out_dir);
+
+  }
 
   unlink(fn); /* Ignore errors */
 
@@ -7522,7 +8609,7 @@ static void fix_up_sync(void) {
 
     if (force_deterministic)
       FATAL("use -S instead of -M -d");
-    else
+    else if (!smart_mode)
       FATAL("-S already implies -d");
 
   }
@@ -7608,8 +8695,12 @@ EXP_ST void detect_file_args(char** argv) {
 
       /* If we don't have a file name chosen yet, use a safe default. */
 
-      if (!out_file)
+      if (!out_file) {
+        if (file_extension)
+          out_file = alloc_printf("%s/.cur_input.%s", out_dir, file_extension);
+        else
         out_file = alloc_printf("%s/.cur_input", out_dir);
+      }
 
       /* Be sure that we're always using fully-qualified paths. */
 
@@ -7806,7 +8897,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qw:g:lhH:e:")) > 0)
 
     switch (opt) {
 
@@ -7922,7 +9013,8 @@ int main(int argc, char** argv) {
 
       case 'd': /* skip deterministic */
 
-        if (skip_deterministic) FATAL("Multiple -d options not supported");
+        if (skip_deterministic && !smart_mode)
+          FATAL("Multiple -d options not supported");
         skip_deterministic = 1;
         use_splicing = 1;
         break;
@@ -7974,11 +9066,78 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 'w': /* SMART FUZZING mode */
+        if (smart_mode) FATAL("Multiple -w options not supported");
+        smart_mode = 1;
+
+        /* This will also skip deterministic fuzzing */
+        skip_deterministic = 1;
+
+        if (!stricmp(optarg, "peach")) {
+          model_type = MODEL_PEACH;
+          if (!program_exist("peach")) {
+						FATAL("peach cannot be found. Please compile Peach and setup PATH environment variable correctly.");
+					}
+
+        } else {
+          PFATAL ("Unknown Input Model. Only Peach is supported now");
+        }
+        break;
+
+      case 'g':
+        if (input_model_file) FATAL("Multiple -g options not supported");
+
+        input_model_file = optarg;
+
+        /* Check if exists */
+        FILE * f = fopen(input_model_file, "r");
+        if (f) fclose(f);
+        else FATAL("File %s does not exist!", input_model_file);
+
+        break;
+
+      case 'h':
+        if (stacking_mutation_mode) FATAL("Multipe -h options not supported");
+        stacking_mutation_mode = 1;
+        break;
+
+      case 'l':
+        if (smart_log_mode) FATAL("Multiple -l options not supported");
+        smart_log_mode = 1;
+        break;
+
+      case 'H':
+        if (smart_mutation_limit) FATAL("Multiple -H options not supported");
+
+        errno = 0;
+        smart_mutation_limit = strtol(optarg, NULL, 0);
+
+        if (errno) FATAL("Numeric format error of -H option");
+
+        break;
+
+      case 'e':
+
+        if (file_extension) FATAL("Multiple -e options not supported");
+
+        file_extension = optarg;
+
+        break;
+
       default:
 
         usage(argv[0]);
 
     }
+
+  if (stacking_mutation_mode && !smart_mode)
+      FATAL("Mixed mode (-h) requires smart fuzzing enabled (-w)");
+
+  if (smart_mutation_limit && !smart_mode)
+      FATAL("Smart mutations limit (-H) requires smart fuzzing enabled (-w)");
+
+  if (input_model_file && (!smart_mode || model_type != MODEL_PEACH))
+      FATAL("Input model file (-g) is only for smart fuzzing using peach (-w peach)");
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
@@ -7996,6 +9155,9 @@ int main(int argc, char** argv) {
     if (qemu_mode)  FATAL("-Q and -n are mutually exclusive");
 
   }
+
+  if (file_extension)
+    OKF("Using the %s extension for the input file", file_extension);
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
   if (getenv("AFL_NO_CPU_RED"))    no_cpu_meter_red = 1;
@@ -8039,7 +9201,13 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
+
+  /* Initialize AFLSmart logging */
+  if (smart_mode && smart_log_mode)
+    smart_log_init(out_dir);
+
   read_testcases();
+  initial_queue_num = queued_paths;
   load_auto();
 
   pivot_inputs();
@@ -8113,7 +9281,10 @@ int main(int argc, char** argv) {
 
       if (queued_paths == prev_queued) {
 
-        if (use_splicing) cycles_wo_finds++; else use_splicing = 1;
+        if (use_splicing)
+          cycles_wo_finds++;
+        else
+          use_splicing = 1;
 
       } else cycles_wo_finds = 0;
 
