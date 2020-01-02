@@ -23,7 +23,7 @@
 
 #define ASHMEM_DEVICE "/dev/ashmem"
 
-static inline int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf) {
+int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf) {
   int ret = 0;
   if (__cmd == IPC_RMID) {
     int length = ioctl(__shmid, ASHMEM_GET_SIZE, NULL);
@@ -35,7 +35,7 @@ static inline int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf) {
   return ret;
 }
 
-static inline int shmget(key_t __key, size_t __size, int __shmflg) {
+int shmget(key_t __key, size_t __size, int __shmflg) {
   (void) __shmflg;
   int fd, ret;
   char ourkey[11];
@@ -60,7 +60,7 @@ error:
   return ret;
 }
 
-static inline void *shmat(int __shmid, const void *__shmaddr, int __shmflg) {
+void *shmat(int __shmid, const void *__shmaddr, int __shmflg) {
   (void) __shmflg;
   int size;
   void *ptr;
