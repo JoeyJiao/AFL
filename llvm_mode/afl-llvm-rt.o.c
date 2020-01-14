@@ -70,7 +70,7 @@ static u8 is_persistent;
 
 /* SHM setup. */
 
-static void __afl_map_shm(void) {
+void __afl_map_shm(void) {
 
   u8 *id_str = getenv(SHM_ENV_VAR);
 
