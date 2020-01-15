@@ -7936,7 +7936,10 @@ static void handle_timeout(int sig) {
   if (child_pid > 0) {
 
     child_timed_out = 1; 
-    kill(child_pid, SIGKILL);
+    if (getenv("AFL_REMOTE_TRACE"))
+      kill(child_pid, SIGTERM);
+    else
+      kill(child_pid, SIGKILL);
 
   } else if (child_pid == -1 && forksrv_pid > 0) {
 
