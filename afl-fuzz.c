@@ -7915,7 +7915,12 @@ static void handle_stop_sig(int sig) {
 
   stop_soon = 1; 
 
-  if (child_pid > 0) kill(child_pid, SIGKILL);
+  if (child_pid > 0) {
+    if (getenv("AFL_REMOTE_TRACE"))
+      kill(child_pid, SIGTERM);
+    else
+      kill(child_pid, SIGKILL);
+  }
   if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
 
 }
