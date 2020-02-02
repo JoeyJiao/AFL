@@ -9330,7 +9330,12 @@ int main(int argc, char** argv) {
   /* If we stopped programmatically, we kill the forkserver and the current runner. 
      If we stopped manually, this is done by the signal handler. */
   if (stop_soon == 2) {
-      if (child_pid > 0) kill(child_pid, SIGKILL);
+      if (child_pid > 0) {
+        if (getenv("AFL_REMOTE_TRACE"))
+          kill(child_pid, SIGTERM);
+        else
+          kill(child_pid, SIGKILL);
+      }
       if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
   }
   /* Now that we've killed the forkserver, we wait for it to be able to get rusage stats. */
