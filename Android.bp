@@ -1,3 +1,7 @@
+subdirs = [
+  "remote_process",
+]
+
 cc_defaults {
   name: "afl-defaults",
 

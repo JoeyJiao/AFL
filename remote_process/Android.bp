@@ -1,0 +1,63 @@
+cc_library_shared {
+  name: "libaflclient",
+  host_supported: true,
+
+  srcs: [
+    "aflclient.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+}
+
+/* TODO: on_exit not supported on android */
+cc_library_host_shared {
+  name: "libaflserver",
+
+  srcs: [
+    "aflserver.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+}
+
+cc_binary {
+  name: "aflserver",
+  host_supported: true,
+
+  srcs: [
+    "server.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+}
+
+cc_binary {
+  name: "aflclient",
+  host_supported: true,
+
+  srcs: [
+    "client.c"
+  ],
+
+  cflags: [
+    "-g",
+    "-O0",
+    "-Wall",
+  ],
+
+  shared_libs: [
+    "libaflclient",
+  ]
+}
