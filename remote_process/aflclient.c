@@ -150,7 +150,15 @@ void afl_client_exit(void) {
 
   char *id_str = getenv(SHM_ENV_VAR);
   if (id_str) {
+    u8 tmp[4];
+
     if (read(fd_fifo_st, &status, 4) != 4) _exit(1);
+
+#ifdef __ANDROID__
+    if (write(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+
+    if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
+#endif
   
     close(fd_fifo_st);
     close(fd_fifo_ctl);

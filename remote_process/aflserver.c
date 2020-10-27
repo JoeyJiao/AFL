@@ -162,15 +162,16 @@ void setup_shm(void) {
   char* shm_str;
 
   if (shm_id != -1) {
+#ifdef __ANDROID__
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#endif
 
     shm_str = (char*)alloc_printf("%d", shm_id);
     if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
 
     ck_free(shm_str);
   } else {
-    shm_str = getenv(SHM_ENV_VAR);
-    if (!shm_str) _exit(1);
-    shm_id = atoi(shm_str);
+    _exit(1);
   }
 
   trace_bits = shmat(shm_id, NULL, 0);
@@ -238,8 +239,15 @@ void setup_afl_server() {
 }
 
 void afl_server_exit(void) {
+  u8 tmp[4];
 
   if (write(fd_fifo_st, &status, 4) != 4) _exit(1);
+
+#ifdef __ANDROID__
+  if (read(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+
+  if (write(fd_fifo_st, trace_bits, MAP_SIZE) != MAP_SIZE) _exit(1);
+#endif
 
   close(fd_fifo_st);
   close(fd_fifo_ctl);
