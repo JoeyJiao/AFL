@@ -45,6 +45,7 @@ int main()
     exit(EXIT_FAILURE);
   }
 
+  printf("is_server: buf=%s\n", buf);
   if (buf[0] == 'c')
     if (buf[1] == 'r')
       if (buf[2] == 'a')

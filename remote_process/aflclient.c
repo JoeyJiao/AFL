@@ -133,20 +133,28 @@ void afl_client_init(void) {
 
 }
 
+void afl_client_exit(void);
+
 __attribute__((constructor(5)))
 void afl_client_setup(void) {
-  setup_signal_handlers();
+  atexit(afl_client_exit);
+  char *id_str = getenv(SHM_ENV_VAR);
+  if (id_str) {
+    setup_signal_handlers();
 
-  afl_client_init();
+    afl_client_init();
+  }
 }
 
-__attribute__((destructor))
 void afl_client_exit(void) {
 
-  if (read(fd_fifo_st, &status, 4) != 4) _exit(1);
-
-  close(fd_fifo_st);
-  close(fd_fifo_ctl);
-
-  _exit(status);
+  char *id_str = getenv(SHM_ENV_VAR);
+  if (id_str) {
+    if (read(fd_fifo_st, &status, 4) != 4) _exit(1);
+  
+    close(fd_fifo_st);
+    close(fd_fifo_ctl);
+  
+    _exit(status);
+  }
 }
