@@ -27,6 +27,7 @@ typedef uint32_t u32;
 #define MAP_SIZE (1 << MAP_SIZE_POW2)
 
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
+#define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
 #define MAX_ALLOC           0x40000000
 
 #define SAYF(x...)    printf(x)
@@ -216,8 +217,14 @@ void setup_afl_server() {
   tmpdir = getenv("TMPDIR");
   if (!tmpdir) tmpdir = "/tmp";
 
-  snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
-  snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+  char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
+  if (fifo_suffix) {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl_%s", tmpdir, fifo_suffix);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st_%s", tmpdir, fifo_suffix);
+  } else {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+  }
 
   if (access(fifo_st, F_OK) != 0) {
     if (mkfifo(fifo_st, 0666) < 0) _exit(1);

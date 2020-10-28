@@ -17,6 +17,7 @@
 #define MAP_SIZE (1 << MAP_SIZE_POW2)
 
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
+#define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
 
 typedef int8_t s8;
 typedef int16_t s16;
@@ -92,8 +93,15 @@ void __afl_start_client(void) {
 
   char fifo_ctl[1024];
   char fifo_st[1024];
-  snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
-  snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+
+  char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
+  if (fifo_suffix) {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl_%s", tmpdir, fifo_suffix);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st_%s", tmpdir, fifo_suffix);
+  } else {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+  }
 
   if (access(fifo_ctl, F_OK) != 0) {
     if (mkfifo(fifo_ctl, 0666) < 0) _exit(1);
