@@ -14,6 +14,14 @@
 #include <dlfcn.h>
 #include "../android-ashmem.h"
 
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+
 
 #define MAP_SIZE_POW2 16
 #define MAP_SIZE (1 << MAP_SIZE_POW2)
@@ -47,7 +55,8 @@ static u8* trace_bits;
 char* tmpdir;
 static char fifo_ctl[1024];
 static char fifo_st[1024];
-static int status;
+int fd_fifo_ctl;
+int fd_fifo_st;
 
 #define ALLOC_MAGIC_C1  0xFF00FF00 /* Used head (dword)  */
 #define ALLOC_MAGIC_F   0xFE00FE00 /* Freed head (dword) */
@@ -170,25 +179,18 @@ void setup_shm(void) {
     if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
 
     ck_free(shm_str);
-  } else {
-    _exit(1);
-  }
 
-  trace_bits = shmat(shm_id, NULL, 0);
+    trace_bits = shmat(shm_id, NULL, 0);
 
-  if (trace_bits == (void*)-1) PFATAL("shmat() failed");
+    if (trace_bits == (void*)-1) PFATAL("shmat() failed");
+  } 
 }
-
-int fd_fifo_ctl;
-int fd_fifo_st;
 
 void handle_sig(int sig) {
   if (sig == 6 || sig == 8) {
     if (client_pid != -1)
       kill(client_pid, sig);
   }
-
-  exit(sig);
 }
 
 void setup_signal_handlers(void) {
@@ -206,11 +208,8 @@ void setup_signal_handlers(void) {
   sigaction(SIGALRM, &sa, NULL);
 }
 
-void afl_server_exit(void);
-
 __attribute__((constructor))
 void setup_afl_server() {
-  atexit(afl_server_exit);
 
   setup_signal_handlers();
 
@@ -225,181 +224,59 @@ void setup_afl_server() {
   }
 
   if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) exit(1);
-
   if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) exit(1);
-
-  if (read(fd_fifo_ctl, &client_pid, 4) != 4) exit(1);
-
-  server_pid = getpid();
-  if (write(fd_fifo_st, &server_pid, 4) != 4) exit(1);
 
   if (read(fd_fifo_ctl, &shm_id, 4) != 4) _exit(1);
 
   setup_shm();
 }
 
-void afl_server_exit(void) {
-  u8 tmp[4];
+int __afl_remote_loop(void) {
+  static u8 first_pass = 1;
+  static u8 loop_end = 0;
 
-  if (write(fd_fifo_st, &status, 4) != 4) _exit(1);
+LOOP_BEGIN:
+  if (!loop_end) {
 
+    if (!first_pass) {
+      if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) exit(1);
+      if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) exit(1);
+  
+      if (read(fd_fifo_ctl, &shm_id, 4) != 4) {
+        // TODO: why happened?
+        goto LOOP_BEGIN;
+      }
+    }
+
+    first_pass = 0;
+
+    if (read(fd_fifo_ctl, &client_pid, 4) != 4) exit(1);
+  
+    server_pid = getpid();
+    if (write(fd_fifo_st, &server_pid, 4) != 4) exit(1);
+
+    loop_end = 1;
+
+  } else {
+
+    u8 tmp[4];
+
+    if (write(fd_fifo_st, &tmp, 4) != 4) _exit(1);
+  
 #ifdef __ANDROID__
-  if (read(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
-
-  if (write(fd_fifo_st, trace_bits, MAP_SIZE) != MAP_SIZE) _exit(1);
+    if (read(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+  
+    if (shm_id != -1) {
+      if (write(fd_fifo_st, trace_bits, MAP_SIZE) != MAP_SIZE) exit(1);
+    }
 #endif
 
-  close(fd_fifo_st);
-  close(fd_fifo_ctl);
+    close(fd_fifo_ctl);
+    close(fd_fifo_st);
 
-  _exit(status);
-}
+    loop_end = 0;
+    goto LOOP_BEGIN;
+  }
 
-/* LD_PRELOAD override that causes normal process termination to instead result
- * in abnormal process termination through a raised SIGABRT signal via abort(3)
- * (even if SIGABRT is ignored, or is caught by a handler that returns).
- * 
- * Loosely based on libminijailpreload.c by Chromium OS authors: 
- * https://android.googlesource.com/platform/external/minijail/+/master/libminijailpreload.c
- */
-
-/* The address of the real main is stored here for fake_main to access */
-static int (*real_main) (int, char **, char **);
-
-/* Fake main(), spliced in before the real call to main() in __libc_start_main */
-static int fake_main(int argc, char **argv, char **envp)
-{	
-	/* Register abort(3) as an atexit(3) handler to be called at normal
-	 * process termination */
-	atexit(afl_server_exit);
-
-	/* Finally call the real main function */
-	status = real_main(argc, argv, envp);
-	return status;
-}
-
-/* LD_PRELOAD override of __libc_start_main.
- *
- * The objective is to splice fake_main above to be executed instead of the
- * program main function. We cannot use LD_PRELOAD to override main directly as
- * LD_PRELOAD can only be used to override functions in dynamically linked
- * shared libraries whose addresses are determined via the Procedure
- * Linkage Table (PLT). However, main's location is not determined via the PLT,
- * but is statically linked to the executable entry routine at __start which
- * pushes main's address onto the stack, then invokes libc's startup routine,
- * which obtains main's address from the stack. 
- * 
- * Instead, we use LD_PRELOAD to override libc's startup routine,
- * __libc_start_main, which is normally responsible for calling main. We can't
- * just run our setup code *here* because the real __libc_start_main is
- * responsible for setting up the C runtime environment, so we can't rely on
- * standard library functions such as malloc(3) or atexit(3) being available
- * yet. 
- */
-int __libc_start_main(int (*main) (int, char **, char **),
-		      int argc, char **ubp_av, void (*init) (void),
-		      void (*fini) (void), void (*rtld_fini) (void),
-		      void (*stack_end))
-{
-	void *libc_handle, *sym;
-	/* This type punning is unfortunately necessary in C99 as casting
-	 * directly from void* to function pointers is left undefined in C99.
-	 * Strictly speaking, the conversion via union is still undefined
-	 * behaviour in C99 (C99 Section 6.2.6.1):
-	 * 
-	 *  "When a value is stored in a member of an object of union type, the
-	 *  bytes of the object representation that do not correspond to that
-	 *  member but do correspond to other members take unspecified values,
-	 *  but the value of the union object shall not thereby become a trap
-	 *  representation."
-	 * 
-	 * However, this conversion is valid in GCC, and dlsym() also in effect
-	 * mandates these conversions to be valid in POSIX system C compilers.
-	 * 
-	 * C11 explicitly allows this conversion (C11 Section 6.5.2.3): 
-	 *  
-	 *  "If the member used to read the contents of a union object is not
-	 *  the same as the member last used to store a value in the object, the
-	 *  appropriate part of the object representation of the value is
-	 *  reinterpreted as an object representation in the new type as
-	 *  described in 6.2.6 (a process sometimes called ‘‘type punning’’).
-	 *  This might be a trap representation.
-	 * 
-	 * Some compilers allow direct conversion between pointers to an object
-	 * or void to a pointer to a function and vice versa. C11's annex “J.5.7
-	 * Function pointer casts lists this as a common extension:
-	 * 
-	 *   "1 A pointer to an object or to void may be cast to a pointer to a
-	 *   function, allowing data to be invoked as a function (6.5.4).
-         * 
-	 *   2 A pointer to a function may be cast to a pointer to an object or
-	 *   to void, allowing a function to be inspected or modified (for
-	 *   example, by a debugger) (6.5.4)."
-	 */
-	union {
-		int (*fn) (int (*main) (int, char **, char **), int argc,
-			   char **ubp_av, void (*init) (void),
-			   void (*fini) (void), void (*rtld_fini) (void),
-			   void (*stack_end));
-		void *sym;
-	} real_libc_start_main;
-
-
-	/* Obtain handle to libc shared library. The object should already be
-	 * resident in the programs memory space, hence we can attempt to open
-	 * it without loading the shared object. If this fails, we are most
-	 * likely dealing with another version of libc.so */
-#ifdef __ANDROID__
-	libc_handle = dlopen("libc.so", RTLD_NOLOAD | RTLD_NOW);
-#else
-	libc_handle = dlopen("libc.so.6", RTLD_NOLOAD | RTLD_NOW);
-#endif
-
-	if (!libc_handle) {
-#ifdef __ANDROID__
-		fprintf(stderr, "can't open handle to libc.so: %s\n",
-#else
-		fprintf(stderr, "can't open handle to libc.so.6: %s\n",
-#endif
-			dlerror());
-		/* We dare not use abort() here because it would run atexit(3)
-		 * handlers and try to flush stdio. */
-		_exit(EXIT_FAILURE);
-	}
-	
-	/* Our LD_PRELOAD will overwrite the real __libc_start_main, so we have
-	 * to look up the real one from libc and invoke it with a pointer to the
-	 * fake main we'd like to run before the real main function. */
-	sym = dlsym(libc_handle, "__libc_start_main");
-	if (!sym) {
-		fprintf(stderr, "can't find __libc_start_main():%s\n",
-			dlerror());
-		_exit(EXIT_FAILURE);
-	}
-
-	real_libc_start_main.sym = sym;
-	real_main = main;
-	
-	/* Close our handle to dynamically loaded libc. Since the libc object
-	 * was already loaded previously, this only decrements the reference
-	 * count to the shared object. Hence, we can be confident that the
-	 * symbol to the read __libc_start_main remains valid even after we
-	 * close our handle. In order to strictly adhere to the API, we could
-	 * defer closing the handle to our spliced-in fake main before it call
-	 * the real main function. */
-	if(dlclose(libc_handle)) {
-#ifdef __ANDROID__
-		fprintf(stderr, "can't close handle to libc.so: %s\n",
-#else
-		fprintf(stderr, "can't close handle to libc.so.6: %s\n",
-#endif
-			dlerror());
-
-		_exit(EXIT_FAILURE);
-	}
-
-	/* Note that we swap fake_main in for main - fake_main should call
-	 * real_main after its setup is done. */
-	return real_libc_start_main.fn(fake_main, argc, ubp_av, init, fini,
-				       rtld_fini, stack_end);
+  return 1;
 }

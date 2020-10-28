@@ -26,7 +26,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 
-static s32 shm_id;
+static s32 shm_id = -1;
 static s32 server_pid = -1;
 static s32 client_pid = -1;
 char* tmpdir;
@@ -37,13 +37,8 @@ u8* trace_bits = __afl_area_initial;
 
 int fd_fifo_ctl;
 int fd_fifo_st;
-static int status;
 
 void handle_sig(int sig) {
-  if (sig == 9 || sig == 15) {
-    if (server_pid != -1)
-      kill(server_pid, sig);
-  }
 
   _exit(sig);
 }
@@ -107,62 +102,52 @@ void __afl_start_client(void) {
   if (access(fifo_st, F_OK) != 0) _exit(1);
 
   if ((fd_fifo_st=open(fifo_st, O_RDONLY)) < 0) _exit(1);
-
   if ((fd_fifo_ctl=open(fifo_ctl, O_WRONLY)) < 0) _exit(1);
 
+  if (write(fd_fifo_ctl, &shm_id, 4) != 4) {
+    _exit(1);
+  }
+
   client_pid = getpid();
-  if (write(fd_fifo_ctl, &client_pid, 4) != 4) _exit(1);
-
-  if (read(fd_fifo_st, &server_pid, 4) != 4) _exit(1);
-
-  if (write(fd_fifo_ctl, &shm_id, 4) != 4) _exit(1);
-
+  if (write(fd_fifo_ctl, &client_pid, 4) != 4) exit(1);
+ 
+  if (read(fd_fifo_st, &server_pid, 4) != 4) exit(1);
 }
 
-void afl_client_init(void) {
+void afl_client_exit(void);
 
+__attribute__((constructor(5)))
+void afl_client_init(void) {
   static u8 init_done;
+
+  atexit(afl_client_exit);
+  setup_signal_handlers();
 
   if (!init_done) {
 
     __afl_map_shm();
     __afl_start_client();
     init_done = 1;
-
-  }
-
-}
-
-void afl_client_exit(void);
-
-__attribute__((constructor(5)))
-void afl_client_setup(void) {
-  atexit(afl_client_exit);
-  char *id_str = getenv(SHM_ENV_VAR);
-  if (id_str) {
-    setup_signal_handlers();
-
-    afl_client_init();
   }
 }
 
 void afl_client_exit(void) {
 
-  char *id_str = getenv(SHM_ENV_VAR);
-  if (id_str) {
-    u8 tmp[4];
+  u8 tmp[4];
 
-    if (read(fd_fifo_st, &status, 4) != 4) _exit(1);
+  if (read(fd_fifo_st, &tmp, 4) != 4) _exit(1);
 
 #ifdef __ANDROID__
-    if (write(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+  if (write(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
 
+  char *id_str = getenv(SHM_ENV_VAR);
+  if (id_str) {
     if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
+  }
 #endif
   
-    close(fd_fifo_st);
-    close(fd_fifo_ctl);
+  close(fd_fifo_st);
+  close(fd_fifo_ctl);
   
-    _exit(status);
-  }
+  _exit(0);
 }
