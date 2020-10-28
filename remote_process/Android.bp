@@ -41,6 +41,10 @@ cc_binary {
     "-O0",
     "-Wall",
   ],
+
+  shared_libs: [
+    "libaflserver",
+  ],
 }
 
 cc_binary {

@@ -239,8 +239,8 @@ LOOP_BEGIN:
   if (!loop_end) {
 
     if (!first_pass) {
-      if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) goto error;
-      if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) goto error;
+      if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
+      if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
   
       if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
     }
@@ -275,9 +275,12 @@ LOOP_BEGIN:
     goto LOOP_BEGIN;
   }
 
+  return 1;
+
 error:
   close(fd_fifo_ctl);
   close(fd_fifo_st);
 
-  return 1;
+  loop_end = 0;
+  goto LOOP_BEGIN;
 }
