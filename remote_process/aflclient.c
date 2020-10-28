@@ -104,14 +104,12 @@ void __afl_start_client(void) {
   if ((fd_fifo_st=open(fifo_st, O_RDONLY)) < 0) _exit(1);
   if ((fd_fifo_ctl=open(fifo_ctl, O_WRONLY)) < 0) _exit(1);
 
-  if (write(fd_fifo_ctl, &shm_id, 4) != 4) {
-    _exit(1);
-  }
+  if (write(fd_fifo_ctl, &shm_id, 4) != 4) _exit(1);
 
   client_pid = getpid();
-  if (write(fd_fifo_ctl, &client_pid, 4) != 4) exit(1);
+  if (write(fd_fifo_ctl, &client_pid, 4) != 4) _exit(1);
  
-  if (read(fd_fifo_st, &server_pid, 4) != 4) exit(1);
+  if (read(fd_fifo_st, &server_pid, 4) != 4) _exit(1);
 }
 
 void afl_client_exit(void);

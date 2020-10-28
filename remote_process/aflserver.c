@@ -37,7 +37,7 @@ typedef uint32_t u32;
     SAYF("\n    Stop location : %s(), %s:%u\n", \
          __FUNCTION__, __FILE__, __LINE__); \
     SAYF("       OS message : %s\n", strerror(errno)); \
-    exit(1); \
+    _exit(1); \
   } while (0)
 
 typedef int8_t s8;
@@ -80,7 +80,7 @@ int fd_fifo_st;
     SAYF("\n[-] PROGRAM ABORT : " x); \
     SAYF("\n         Location : %s(), %s:%u\n\n", \
          __FUNCTION__, __FILE__, __LINE__); \
-    exit(1); \
+    _exit(1); \
   } while (0)
 
 #define CHECK_PTR(_p) do { \
@@ -220,11 +220,11 @@ void setup_afl_server() {
   snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
 
   if (access(fifo_st, F_OK) != 0) {
-    if (mkfifo(fifo_st, 0666) < 0) exit(1);
+    if (mkfifo(fifo_st, 0666) < 0) _exit(1);
   }
 
-  if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) exit(1);
-  if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) exit(1);
+  if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
+  if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
 
   if (read(fd_fifo_ctl, &shm_id, 4) != 4) _exit(1);
 
@@ -239,21 +239,18 @@ LOOP_BEGIN:
   if (!loop_end) {
 
     if (!first_pass) {
-      if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) exit(1);
-      if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) exit(1);
+      if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) goto error;
+      if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) goto error;
   
-      if (read(fd_fifo_ctl, &shm_id, 4) != 4) {
-        // TODO: why happened?
-        goto LOOP_BEGIN;
-      }
+      if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
     }
 
     first_pass = 0;
 
-    if (read(fd_fifo_ctl, &client_pid, 4) != 4) exit(1);
+    if (read(fd_fifo_ctl, &client_pid, 4) != 4) goto error;
   
     server_pid = getpid();
-    if (write(fd_fifo_st, &server_pid, 4) != 4) exit(1);
+    if (write(fd_fifo_st, &server_pid, 4) != 4) goto error;
 
     loop_end = 1;
 
@@ -261,13 +258,13 @@ LOOP_BEGIN:
 
     u8 tmp[4];
 
-    if (write(fd_fifo_st, &tmp, 4) != 4) _exit(1);
+    if (write(fd_fifo_st, &tmp, 4) != 4) goto error;
   
 #ifdef __ANDROID__
-    if (read(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+    if (read(fd_fifo_ctl, &tmp, 4) != 4) goto error;
   
     if (shm_id != -1) {
-      if (write(fd_fifo_st, trace_bits, MAP_SIZE) != MAP_SIZE) exit(1);
+      if (write(fd_fifo_st, trace_bits, MAP_SIZE) != MAP_SIZE) goto error;
     }
 #endif
 
@@ -277,6 +274,10 @@ LOOP_BEGIN:
     loop_end = 0;
     goto LOOP_BEGIN;
   }
+
+error:
+  close(fd_fifo_ctl);
+  close(fd_fifo_st);
 
   return 1;
 }
