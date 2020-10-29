@@ -12,8 +12,7 @@ endif
 export LD_LIBRARY_PATH := .:$(LD_LIBRARY_PATH)
 
 all: clean
-	$(CC) aflserver.c -shared $(CFLAGS) -o libaflserver.so
-	AFL_TRACE_PC=1 AFL_CC=$(CC) afl-clang-fast $(CFLAGS) -L . -laflserver -o remote_server server.c
+	AFL_TRACE_PC=1 AFL_CC=$(CC) afl-clang-fast $(CFLAGS) -o remote_server server.c
 	$(CC) $(CFLAGS) -shared aflclient.c -o libaflclient.so
 	$(CC) $(CFLAGS) -L . -laflclient client.c -o remote_client
 	AFL_TRACE_PC=1 AFL_CC=clang afl-clang-fast $(CFLAGS) -o crash crash.c
@@ -22,7 +21,7 @@ clean:
 	rm -rf *.so remote_server remote_client crash
 
 runserver:
-	while true; do ./remote_server; done
+	while true; do timeout 60s ./remote_server; done
 
 fuzz:
 	if [ -d output ]; then AFL_NO_FORKSRV=1 AFL_SKIP_BIN_CHECK=1 afl-fuzz -i - -o output -m none -x words.dict -- ./remote_client; else AFL_NO_FORKSRV=1 AFL_SKIP_BIN_CHECK=1 afl-fuzz -i input -o output -m none -x words.dict -- ./remote_client; fi

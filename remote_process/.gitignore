@@ -1,4 +1,4 @@
 *.so
-server
-client
+remote_server
+remote_client
 crash
