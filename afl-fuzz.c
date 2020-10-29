@@ -58,6 +58,7 @@
 #include <termios.h>
 #include <dlfcn.h>
 #include <sched.h>
+#include <limits.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -108,6 +109,9 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
 
 EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
 static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
+
+static u32 min_length;                /* Min corpus length                */
+static u32 max_length = UINT_MAX;     /* Max corpus length                */
 
 EXP_ST u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
@@ -4856,6 +4860,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
+  if (len < min_length || len > max_length) return 1;
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
@@ -8214,6 +8219,8 @@ static void usage(u8* argv0) {
        "  -t msec       - timeout for each run (auto-scaled, 50-%u ms)\n"
        "  -m megs       - memory limit for child process (%u MB)\n"
        "  -Q            - use binary-only instrumentation (QEMU mode)\n\n"     
+       "  -s len        - min corpus length to run target\n\n"
+       "  -a len        - max corpus length to run target\n\n"
  
        "Fuzzing behavior settings:\n\n"
 
@@ -8909,7 +8916,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qw:g:lhH:e:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qw:g:lhH:e:s:a:")) > 0)
 
     switch (opt) {
 
@@ -9076,6 +9083,18 @@ int main(int argc, char** argv) {
 
         if (!mem_limit_given) mem_limit = MEM_LIMIT_QEMU;
 
+        break;
+
+      case 's': /* Min corpus length */
+
+        if (min_length) FATAL("Multiple -s options not supported");
+        min_length = (u32)atol(optarg);
+        break;
+
+      case 'a': /* Max corpus length */
+
+        if (max_length != UINT_MAX) FATAL("Multiple -a options not supported");
+        max_length = (u32)atol(optarg);
         break;
 
       case 'w': /* SMART FUZZING mode */
