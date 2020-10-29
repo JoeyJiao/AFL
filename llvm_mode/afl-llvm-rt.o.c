@@ -41,6 +41,10 @@
 #include <sys/shm.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
 
 /* This is a somewhat ugly hack for the experimental 'trace-pc-guard' mode.
    Basically, we need to make sure that the forkserver is initialized after
@@ -62,6 +66,14 @@ u8* __afl_area_ptr = __afl_area_initial;
 
 __thread u32 __afl_prev_loc;
 
+static s32 shm_id = -1;
+static s32 server_pid = -1,
+           client_pid = -1;
+char* tmpdir;
+static char fifo_ctl[1024];
+static char fifo_st[1024];
+int fd_fifo_ctl;
+int fd_fifo_st;
 
 /* Running in persistent mode? */
 
@@ -80,7 +92,7 @@ void __afl_map_shm(void) {
 
   if (id_str) {
 
-    u32 shm_id = atoi(id_str);
+    shm_id = atoi(id_str);
 
     __afl_area_ptr = shmat(shm_id, NULL, 0);
 
@@ -311,4 +323,117 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
 
   }
 
+}
+
+void setup_shm(void) {
+  char shm_str[11];
+
+  if (shm_id != -1) {
+#ifdef __ANDROID__
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+#endif
+
+    snprintf(shm_str, sizeof(shm_str), "%d", shm_id);
+    if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
+
+    __afl_map_shm();
+  } 
+}
+
+void handle_sig(int sig) {
+  if (sig == 6 || sig == 8) {
+    if (client_pid != -1)
+      kill(client_pid, sig);
+  }
+}
+
+void setup_signal_handlers(void) {
+  struct sigaction sa;
+
+  sa.sa_handler = NULL;
+  sa.sa_flags = SA_RESTART;
+  sa.sa_sigaction = NULL;
+
+  sigemptyset(&sa.sa_mask);
+  sa.sa_handler = handle_sig;
+
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGFPE, &sa, NULL);
+  sigaction(SIGALRM, &sa, NULL);
+}
+
+__attribute__((constructor))
+void setup_afl_server() {
+
+  setup_signal_handlers();
+
+  tmpdir = getenv("TMPDIR");
+  if (!tmpdir) tmpdir = "/tmp";
+
+  char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
+  if (fifo_suffix) {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl_%s", tmpdir, fifo_suffix);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st_%s", tmpdir, fifo_suffix);
+  } else {
+    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
+    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+  }
+
+  if (access(fifo_st, F_OK) != 0) {
+    if (mkfifo(fifo_st, 0666) < 0) _exit(1);
+  }
+}
+
+int __afl_remote_loop(void) {
+  static u8 first_pass = 1;
+  static u8 loop_end = 0;
+
+LOOP_BEGIN:
+  if (!loop_end) {
+
+    if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
+    if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
+
+    if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
+ 
+    if (first_pass) setup_shm();
+
+    first_pass = 0;
+
+    if (read(fd_fifo_ctl, &client_pid, 4) != 4) goto error;
+  
+    server_pid = getpid();
+    if (write(fd_fifo_st, &server_pid, 4) != 4) goto error;
+
+    loop_end = 1;
+
+  } else {
+
+    u8 tmp[4];
+
+    if (write(fd_fifo_st, &tmp, 4) != 4) goto error;
+  
+#ifdef __ANDROID__
+    if (read(fd_fifo_ctl, &tmp, 4) != 4) goto error;
+  
+    if (shm_id != -1) {
+      if (write(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) goto error;
+    }
+#endif
+
+    close(fd_fifo_ctl);
+    close(fd_fifo_st);
+
+    loop_end = 0;
+    goto LOOP_BEGIN;
+  }
+
+  return 1;
+
+error:
+  close(fd_fifo_ctl);
+  close(fd_fifo_st);
+
+  loop_end = 0;
+  goto LOOP_BEGIN;
 }

@@ -1,24 +1,12 @@
 cc_library_shared {
   name: "libaflclient",
+  compile_multilib: "both",
+  vendor_available: true,
   host_supported: true,
+  recovery_available: true,
 
   srcs: [
     "aflclient.c"
-  ],
-
-  cflags: [
-    "-g",
-    "-O0",
-    "-Wall",
-  ],
-}
-
-cc_library_shared {
-  name: "libaflserver",
-  host_supported: true,
-
-  srcs: [
-    "aflserver.c"
   ],
 
   cflags: [
@@ -40,10 +28,6 @@ cc_binary {
     "-g",
     "-O0",
     "-Wall",
-  ],
-
-  shared_libs: [
-    "libaflserver",
   ],
 }
 
