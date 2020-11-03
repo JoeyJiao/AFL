@@ -45,6 +45,8 @@
 #include <fcntl.h>
 
 #define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
+#define AFL_DEBUG           "AFL_DEBUG"
+#define AFL_NO_REMOTE       "AFL_NO_REMOTE"
 
 /* This is a somewhat ugly hack for the experimental 'trace-pc-guard' mode.
    Basically, we need to make sure that the forkserver is initialized after
@@ -72,8 +74,11 @@ static s32 server_pid = -1,
 char* tmpdir;
 static char fifo_ctl[1024];
 static char fifo_st[1024];
-int fd_fifo_ctl;
-int fd_fifo_st;
+static int fd_fifo_ctl;
+static int fd_fifo_st;
+static u8 first_pass = 1;
+static u8 __afl_loop_flag = 0;
+static char afl_debug = 0;
 
 /* Running in persistent mode? */
 
@@ -337,7 +342,15 @@ void setup_shm(void) {
     if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
 
     __afl_map_shm();
-  } 
+  } else if (afl_debug && shm_id == -1) {
+    printf("AFL remote: debug setup_shm\n");
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+
+    snprintf(shm_str, sizeof(shm_str), "%d", shm_id);
+    if (!getenv("AFL_DUMB_MODE")) setenv(SHM_ENV_VAR, shm_str, 1);
+
+    __afl_map_shm();
+  }
 }
 
 void handle_sig(int sig) {
@@ -364,6 +377,8 @@ void setup_signal_handlers(void) {
 
 __attribute__((constructor))
 void setup_afl_server() {
+  if (getenv(AFL_NO_REMOTE)) return;
+  if (getenv(AFL_DEBUG)) afl_debug = 1;
 
   setup_signal_handlers();
 
@@ -384,56 +399,75 @@ void setup_afl_server() {
   }
 }
 
-int __afl_remote_loop(void) {
-  static u8 first_pass = 1;
-  static u8 loop_end = 0;
+int afl_remote_loop_start(void) {
+  if (getenv(AFL_NO_REMOTE)) return 0;
+  if (afl_debug) printf("afl_remote_loop_start\n");
+
+  if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
+  if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
+
+  if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
+
+  if (first_pass) setup_shm();
+
+  first_pass = 0;
+
+  if (read(fd_fifo_ctl, &client_pid, 4) != 4) goto error;
+
+  server_pid = getpid();
+  if (write(fd_fifo_st, &server_pid, 4) != 4) goto error;
+
+  return 0;
+
+error:
+  close(fd_fifo_ctl);
+  close(fd_fifo_st);
+  return 1;
+}
+
+int afl_remote_loop_next(void) {
+  if (getenv(AFL_NO_REMOTE)) return 0;
+  if (afl_debug) printf("afl_remote_loop_next\n");
+
+  u8 tmp[4];
+
+  if (read(fd_fifo_ctl, &tmp, 4) != 4) goto error;
+
+#ifdef __ANDROID__
+  if (shm_id != -1) {
+    if (write(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) goto error;
+  }
+#endif
+
+  close(fd_fifo_ctl);
+  close(fd_fifo_st);
+  return 0;
+
+error:
+  close(fd_fifo_ctl);
+  close(fd_fifo_st);
+  return 1;
+}
+
+int afl_remote_loop(void) {
+  if (getenv(AFL_NO_REMOTE)) return 1;
 
 LOOP_BEGIN:
-  if (!loop_end) {
+  if (!__afl_loop_flag) {
 
-    if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
-    if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
-
-    if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
- 
-    if (first_pass) setup_shm();
-
-    first_pass = 0;
-
-    if (read(fd_fifo_ctl, &client_pid, 4) != 4) goto error;
-  
-    server_pid = getpid();
-    if (write(fd_fifo_st, &server_pid, 4) != 4) goto error;
-
-    loop_end = 1;
+    if(afl_remote_loop_start()) goto error;
+    __afl_loop_flag = 1;
 
   } else {
 
-    u8 tmp[4];
+    if(afl_remote_loop_next()) goto error;
+    __afl_loop_flag = 0;
 
-    if (write(fd_fifo_st, &tmp, 4) != 4) goto error;
-  
-#ifdef __ANDROID__
-    if (read(fd_fifo_ctl, &tmp, 4) != 4) goto error;
-  
-    if (shm_id != -1) {
-      if (write(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) goto error;
-    }
-#endif
-
-    close(fd_fifo_ctl);
-    close(fd_fifo_st);
-
-    loop_end = 0;
-    goto LOOP_BEGIN;
   }
 
   return 1;
 
 error:
-  close(fd_fifo_ctl);
-  close(fd_fifo_st);
-
-  loop_end = 0;
+  __afl_loop_flag = 0;
   goto LOOP_BEGIN;
 }

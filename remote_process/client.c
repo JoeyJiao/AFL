@@ -6,8 +6,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+extern void afl_client_start(void);
+
 int main()
 {
+  afl_client_start();
   struct sockaddr_un addr;
   int sfd;
   char buf[1024];

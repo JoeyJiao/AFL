@@ -6,7 +6,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-extern int __afl_remote_loop(void);
+extern int afl_remote_loop(void);
 
 int main()
 {
@@ -37,7 +37,7 @@ int main()
     exit(EXIT_FAILURE);
   }
 
-while (__afl_remote_loop()) {
+while (afl_remote_loop()) {
   if ((sock=accept(sfd, (struct sockaddr*)&addr, &addrlen)) < 0) {
     perror("socket accept failed");
     exit(EXIT_FAILURE);

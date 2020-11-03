@@ -18,6 +18,8 @@
 
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
 #define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
+#define AFL_DEBUG           "AFL_DEBUG"
+#define AFL_NO_REMOTE       "AFL_NO_REMOTE"
 
 typedef int8_t s8;
 typedef int16_t s16;
@@ -30,14 +32,16 @@ typedef uint32_t u32;
 static s32 shm_id = -1;
 static s32 server_pid = -1;
 static s32 client_pid = -1;
+static char afl_debug = 0;
 char* tmpdir;
+
+static char fifo_ctl[1024];
+static char fifo_st[1024];
+static int fd_fifo_ctl;
+static int fd_fifo_st;
 
 u8  __afl_area_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
-u8* trace_bits = __afl_area_initial;
-
-int fd_fifo_ctl;
-int fd_fifo_st;
 
 void handle_sig(int sig) {
 
@@ -88,11 +92,9 @@ void __afl_map_shm(void) {
 }
 
 void __afl_start_client(void) {
+
   tmpdir = getenv("TMPDIR");
   if (!tmpdir) tmpdir = "/tmp";
-
-  char fifo_ctl[1024];
-  char fifo_st[1024];
 
   char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
   if (fifo_suffix) {
@@ -108,6 +110,10 @@ void __afl_start_client(void) {
   }
 
   if (access(fifo_st, F_OK) != 0) _exit(1);
+}
+
+void afl_client_start(void) {
+  if (getenv(AFL_NO_REMOTE)) return;
 
   if ((fd_fifo_st=open(fifo_st, O_RDONLY)) < 0) _exit(1);
   if ((fd_fifo_ctl=open(fifo_ctl, O_WRONLY)) < 0) _exit(1);
@@ -126,6 +132,9 @@ __attribute__((constructor(5)))
 void afl_client_init(void) {
   static u8 init_done;
 
+  if (getenv(AFL_NO_REMOTE)) return;
+  if (getenv(AFL_DEBUG)) afl_debug = 1;
+
   atexit(afl_client_exit);
   setup_signal_handlers();
 
@@ -138,18 +147,18 @@ void afl_client_init(void) {
 }
 
 void afl_client_exit(void) {
-
   u8 tmp[4];
 
-  if (read(fd_fifo_st, &tmp, 4) != 4) _exit(1);
-
-#ifdef __ANDROID__
+  // phone server that I will exit now
   if (write(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
 
+#ifdef __ANDROID__
+  // AFL context
   char *id_str = getenv(SHM_ENV_VAR);
-  if (id_str) {
+  if (id_str)
     if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
-  }
+  if (afl_debug) 
+    if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
 #endif
   
   close(fd_fifo_st);
