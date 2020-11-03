@@ -155,9 +155,16 @@ void afl_client_init(void) {
   }
 }
 
+void afl_client_continue(void) {
+  if (getenv(AFL_NO_REMOTE)) return;
+  if (afl_debug) printf("afl_client_continue\n");
+  if (send(afl_sock_fd, "CONT", 4, 0) != 4) _exit(1);
+}
+
 void afl_client_exit(void) {
   u8 tmp[4];
 
+  memset(tmp, 0, 4);
   // phone server that I will exit now
   if (send(afl_sock_fd, &tmp, 4, 0) != 4) _exit(1);
 

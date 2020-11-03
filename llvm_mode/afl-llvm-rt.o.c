@@ -49,6 +49,7 @@
 #define AFL_SOCK_SUFFIX     "AFL_SOCK_SUFFIX"
 #define AFL_DEBUG           "AFL_DEBUG"
 #define AFL_NO_REMOTE       "AFL_NO_REMOTE"
+#define AFL_REMOTE_SKIP_COUNT    "AFL_REMOTE_SKIP_COUNT"
 
 /* This is a somewhat ugly hack for the experimental 'trace-pc-guard' mode.
    Basically, we need to make sure that the forkserver is initialized after
@@ -75,12 +76,15 @@ static s32 server_pid = -1,
            client_pid = -1;
 char* tmpdir;
 static u8 first_pass = 1;
+static u8 loop_continue = 0;
 static u8 __afl_loop_flag = 0;
 static char afl_debug = 0;
 static struct sockaddr_un addr;
 static char sock_str[1024];
 static int sock_fd;
 static int afl_sock_fd;
+static unsigned int afl_remote_skip_count = 0;
+static unsigned int loop_count = 0;
 
 /* Running in persistent mode? */
 
@@ -380,6 +384,7 @@ __attribute__((constructor))
 void setup_afl_server() {
   if (getenv(AFL_NO_REMOTE)) return;
   if (getenv(AFL_DEBUG)) afl_debug = 1;
+  if (getenv(AFL_REMOTE_SKIP_COUNT)) afl_remote_skip_count = (unsigned int)atol(getenv(AFL_REMOTE_SKIP_COUNT));
 
   setup_signal_handlers();
 
@@ -419,6 +424,12 @@ void setup_afl_server() {
 int afl_remote_loop_start(void) {
   if (getenv(AFL_NO_REMOTE)) return 0;
   if (afl_debug) printf("afl_remote_loop_start\n");
+  if (loop_count < afl_remote_skip_count) return 0;
+  if (loop_continue) {
+    if (afl_debug) printf("afl_remote_loop_continue\n");
+    loop_continue = 0;
+    return 0;
+  }
 
   unsigned int addrlen = sizeof(addr);
   if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
@@ -448,10 +459,20 @@ error:
 int afl_remote_loop_next(void) {
   if (getenv(AFL_NO_REMOTE)) return 0;
   if (afl_debug) printf("afl_remote_loop_next\n");
+  if (loop_count < afl_remote_skip_count) {
+    loop_count++;
+    return 0;
+  }
 
   u8 tmp[4];
 
+  memset(tmp, 0, 4);
   if (recv(afl_sock_fd, &tmp, 4, MSG_WAITALL) != 4) goto error;
+
+  if (!memcmp(tmp, "CONT", 4)) {
+    loop_continue = 1;
+    return 0;
+  }
 
 #ifdef __ANDROID__
   if (shm_id != -1) {
@@ -479,7 +500,7 @@ LOOP_BEGIN:
 
   } else {
 
-    if(afl_remote_loop_next()) goto error;
+    if (afl_remote_loop_next()) goto error;
     __afl_loop_flag = 0;
     goto LOOP_BEGIN;
 
