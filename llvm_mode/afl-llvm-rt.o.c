@@ -42,9 +42,11 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 
-#define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
+#define AFL_SOCK_SUFFIX     "AFL_SOCK_SUFFIX"
 #define AFL_DEBUG           "AFL_DEBUG"
 #define AFL_NO_REMOTE       "AFL_NO_REMOTE"
 
@@ -72,13 +74,13 @@ static s32 shm_id = -1;
 static s32 server_pid = -1,
            client_pid = -1;
 char* tmpdir;
-static char fifo_ctl[1024];
-static char fifo_st[1024];
-static int fd_fifo_ctl;
-static int fd_fifo_st;
 static u8 first_pass = 1;
 static u8 __afl_loop_flag = 0;
 static char afl_debug = 0;
+static struct sockaddr_un addr;
+static char sock_str[1024];
+static int sock_fd;
+static int afl_sock_fd;
 
 /* Running in persistent mode? */
 
@@ -343,7 +345,6 @@ void setup_shm(void) {
 
     __afl_map_shm();
   } else if (afl_debug && shm_id == -1) {
-    printf("AFL remote: debug setup_shm\n");
     shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
 
     snprintf(shm_str, sizeof(shm_str), "%d", shm_id);
@@ -385,17 +386,33 @@ void setup_afl_server() {
   tmpdir = getenv("TMPDIR");
   if (!tmpdir) tmpdir = "/tmp";
 
-  char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
-  if (fifo_suffix) {
-    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl_%s", tmpdir, fifo_suffix);
-    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st_%s", tmpdir, fifo_suffix);
-  } else {
-    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
-    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
+  char *sock_suffix = getenv(AFL_SOCK_SUFFIX);
+  if (sock_suffix)
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock_%s", tmpdir, sock_suffix);
+  else
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock", tmpdir);
+
+  unlink(sock_str);
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, sock_str, sizeof(addr.sun_path));
+
+  if ((sock_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+    perror("socket create failed");
+    _exit(EXIT_FAILURE);
   }
 
-  if (access(fifo_st, F_OK) != 0) {
-    if (mkfifo(fifo_st, 0666) < 0) _exit(1);
+  unsigned int addrlen = sizeof(addr);
+  if (bind(sock_fd, (struct sockaddr*)&addr, addrlen) < 0) {
+    perror("socket bind failed");
+    close(sock_fd);
+    _exit(EXIT_FAILURE);
+  }
+
+  if (listen(sock_fd, 1) < 0) {
+    perror("socket listen failed");
+    close(sock_fd);
+    exit(EXIT_FAILURE);
   }
 }
 
@@ -403,25 +420,28 @@ int afl_remote_loop_start(void) {
   if (getenv(AFL_NO_REMOTE)) return 0;
   if (afl_debug) printf("afl_remote_loop_start\n");
 
-  if ((fd_fifo_st=open(fifo_st, O_WRONLY)) < 0) _exit(1);
-  if ((fd_fifo_ctl=open(fifo_ctl, O_RDONLY)) < 0) _exit(1);
+  unsigned int addrlen = sizeof(addr);
+  if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
+    perror("socket accept failed");
+    _exit(EXIT_FAILURE);
+  }
 
-  if (read(fd_fifo_ctl, &shm_id, 4) != 4) goto error;
+  if (recv(afl_sock_fd, &shm_id, 4, MSG_WAITALL) != 4) goto error;
 
   if (first_pass) setup_shm();
 
   first_pass = 0;
 
-  if (read(fd_fifo_ctl, &client_pid, 4) != 4) goto error;
-
   server_pid = getpid();
-  if (write(fd_fifo_st, &server_pid, 4) != 4) goto error;
+  if (send(afl_sock_fd, &server_pid, 4, 0) != 4) goto error;
+
+  if (recv(afl_sock_fd, &client_pid, 4, MSG_WAITALL) != 4) goto error;
 
   return 0;
 
 error:
-  close(fd_fifo_ctl);
-  close(fd_fifo_st);
+  close(afl_sock_fd);
+  close(sock_fd);
   return 1;
 }
 
@@ -431,21 +451,20 @@ int afl_remote_loop_next(void) {
 
   u8 tmp[4];
 
-  if (read(fd_fifo_ctl, &tmp, 4) != 4) goto error;
+  if (recv(afl_sock_fd, &tmp, 4, MSG_WAITALL) != 4) goto error;
 
 #ifdef __ANDROID__
   if (shm_id != -1) {
-    if (write(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) goto error;
+    if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
   }
 #endif
 
-  close(fd_fifo_ctl);
-  close(fd_fifo_st);
+  close(afl_sock_fd);
   return 0;
 
 error:
-  close(fd_fifo_ctl);
-  close(fd_fifo_st);
+  close(afl_sock_fd);
+  close(sock_fd);
   return 1;
 }
 
@@ -462,6 +481,7 @@ LOOP_BEGIN:
 
     if(afl_remote_loop_next()) goto error;
     __afl_loop_flag = 0;
+    goto LOOP_BEGIN;
 
   }
 

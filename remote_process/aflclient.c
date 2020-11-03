@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -17,7 +19,7 @@
 #define MAP_SIZE (1 << MAP_SIZE_POW2)
 
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
-#define AFL_FIFO_SUFFIX     "AFL_FIFO_SUFFIX"
+#define AFL_SOCK_SUFFIX     "AFL_SOCK_SUFFIX"
 #define AFL_DEBUG           "AFL_DEBUG"
 #define AFL_NO_REMOTE       "AFL_NO_REMOTE"
 
@@ -34,11 +36,9 @@ static s32 server_pid = -1;
 static s32 client_pid = -1;
 static char afl_debug = 0;
 char* tmpdir;
-
-static char fifo_ctl[1024];
-static char fifo_st[1024];
-static int fd_fifo_ctl;
-static int fd_fifo_st;
+static struct sockaddr_un addr;
+static char sock_str[1024];
+static int afl_sock_fd;
 
 u8  __afl_area_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
@@ -87,43 +87,52 @@ void __afl_map_shm(void) {
 
     __afl_area_ptr[0] = 1;
 
+  } else if (afl_debug) {
+    shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+    __afl_area_ptr = shmat(shm_id, NULL, 0);
+
+    if (__afl_area_ptr == (void *)-1) _exit(1);
+
+    __afl_area_ptr[0] = 1;
   }
 
 }
 
 void __afl_start_client(void) {
-
   tmpdir = getenv("TMPDIR");
   if (!tmpdir) tmpdir = "/tmp";
 
-  char *fifo_suffix = getenv(AFL_FIFO_SUFFIX);
-  if (fifo_suffix) {
-    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl_%s", tmpdir, fifo_suffix);
-    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st_%s", tmpdir, fifo_suffix);
-  } else {
-    snprintf(fifo_ctl, sizeof(fifo_ctl), "%s/fifo_ctl", tmpdir);
-    snprintf(fifo_st, sizeof(fifo_st), "%s/fifo_st", tmpdir);
-  }
+  char *sock_suffix = getenv(AFL_SOCK_SUFFIX);
+  if (sock_suffix)
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock_%s", tmpdir, sock_suffix);
+  else
+    snprintf(sock_str, sizeof(sock_str), "%s/afl_sock", tmpdir);
 
-  if (access(fifo_ctl, F_OK) != 0) {
-    if (mkfifo(fifo_ctl, 0666) < 0) _exit(1);
-  }
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, sock_str, sizeof(addr.sun_path));
 
-  if (access(fifo_st, F_OK) != 0) _exit(1);
+  if ((afl_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+    perror("socket create failed");
+    exit(EXIT_FAILURE);
+  }
 }
 
 void afl_client_start(void) {
   if (getenv(AFL_NO_REMOTE)) return;
 
-  if ((fd_fifo_st=open(fifo_st, O_RDONLY)) < 0) _exit(1);
-  if ((fd_fifo_ctl=open(fifo_ctl, O_WRONLY)) < 0) _exit(1);
+RECONNECT:
+  if (connect(afl_sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    usleep(1000);
+    goto RECONNECT;
+  }
 
-  if (write(fd_fifo_ctl, &shm_id, 4) != 4) _exit(1);
+  if (send(afl_sock_fd, &shm_id, 4, 0) != 4) _exit(1);
+ 
+  if (recv(afl_sock_fd, &server_pid, 4, MSG_WAITALL) != 4) _exit(1);
 
   client_pid = getpid();
-  if (write(fd_fifo_ctl, &client_pid, 4) != 4) _exit(1);
- 
-  if (read(fd_fifo_st, &server_pid, 4) != 4) _exit(1);
+  if (send(afl_sock_fd, &client_pid, 4, 0) != 4) _exit(1);
 }
 
 void afl_client_exit(void);
@@ -150,19 +159,18 @@ void afl_client_exit(void) {
   u8 tmp[4];
 
   // phone server that I will exit now
-  if (write(fd_fifo_ctl, &tmp, 4) != 4) _exit(1);
+  if (send(afl_sock_fd, &tmp, 4, 0) != 4) _exit(1);
 
 #ifdef __ANDROID__
   // AFL context
   char *id_str = getenv(SHM_ENV_VAR);
   if (id_str)
-    if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
+    if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
   if (afl_debug) 
-    if (read(fd_fifo_st, __afl_area_ptr, MAP_SIZE) != MAP_SIZE) _exit(1);
+    if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
 #endif
   
-  close(fd_fifo_st);
-  close(fd_fifo_ctl);
+  close(afl_sock_fd);
   
   _exit(0);
 }

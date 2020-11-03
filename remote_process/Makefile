@@ -13,8 +13,7 @@ export LD_LIBRARY_PATH := .:$(LD_LIBRARY_PATH)
 
 all: clean
 	AFL_TRACE_PC=1 AFL_CC=$(CC) afl-clang-fast $(CFLAGS) -o remote_server server.c
-	$(CC) $(CFLAGS) -shared aflclient.c -o libaflclient.so
-	$(CC) $(CFLAGS) -L . -laflclient client.c -o remote_client
+	$(CC) $(CFLAGS) aflclient.c client.c -o remote_client
 	AFL_TRACE_PC=1 AFL_CC=clang afl-clang-fast $(CFLAGS) -o crash crash.c
 
 clean:
