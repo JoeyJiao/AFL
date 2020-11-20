@@ -512,3 +512,7 @@ error:
   __afl_loop_flag = 0;
   goto LOOP_BEGIN;
 }
+
+void afl_remote_set_loop_continue(int flag) {
+  loop_continue = flag;
+}
