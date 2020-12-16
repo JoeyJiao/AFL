@@ -60,6 +60,9 @@ void setup_signal_handlers(void) {
 
   sigaction(SIGTERM, &sa, NULL);
   sigaction(SIGKILL, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGFPE, &sa, NULL);
+  sigaction(SIGSEGV, &sa, NULL);
 }
 
 /* SHM setup. */

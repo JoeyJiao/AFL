@@ -359,10 +359,8 @@ void setup_shm(void) {
 }
 
 void handle_sig(int sig) {
-  if (sig == 6 || sig == 8) {
-    if (client_pid != -1)
-      kill(client_pid, sig);
-  }
+  if (client_pid != -1)
+    kill(client_pid, sig);
 }
 
 void setup_signal_handlers(void) {
@@ -377,13 +375,16 @@ void setup_signal_handlers(void) {
 
   sigaction(SIGABRT, &sa, NULL);
   sigaction(SIGFPE, &sa, NULL);
-  sigaction(SIGALRM, &sa, NULL);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGKILL, &sa, NULL);
+  signal(SIGPIPE, SIG_IGN);
 }
 
 __attribute__((constructor))
 void setup_afl_server() {
-  if (getenv(AFL_NO_REMOTE)) return;
   if (getenv(AFL_DEBUG)) afl_debug = 1;
+  if (getenv(AFL_NO_REMOTE)) return;
   if (getenv(AFL_REMOTE_SKIP_COUNT)) afl_remote_skip_count = (unsigned int)atol(getenv(AFL_REMOTE_SKIP_COUNT));
 
   setup_signal_handlers();
@@ -414,7 +415,7 @@ void setup_afl_server() {
     _exit(EXIT_FAILURE);
   }
 
-  if (listen(sock_fd, 1) < 0) {
+  if (listen(sock_fd, 8) < 0) {
     perror("socket listen failed");
     close(sock_fd);
     exit(EXIT_FAILURE);
@@ -422,8 +423,8 @@ void setup_afl_server() {
 }
 
 int afl_remote_loop_start(void) {
-  if (getenv(AFL_NO_REMOTE)) return 0;
   if (afl_debug) printf("afl_remote_loop_start\n");
+  if (getenv(AFL_NO_REMOTE)) return 0;
   if (loop_count < afl_remote_skip_count) return 0;
   if (loop_continue) {
     if (afl_debug) printf("afl_remote_loop_continue\n");
@@ -432,9 +433,12 @@ int afl_remote_loop_start(void) {
   }
 
   unsigned int addrlen = sizeof(addr);
+LOOP:
   if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
     perror("socket accept failed");
-    _exit(EXIT_FAILURE);
+    printf("addrlen=%d\n", addrlen);
+    setup_afl_server();
+    goto LOOP;
   }
 
   if (recv(afl_sock_fd, &shm_id, 4, MSG_WAITALL) != 4) goto error;
@@ -457,8 +461,8 @@ error:
 }
 
 int afl_remote_loop_next(void) {
-  if (getenv(AFL_NO_REMOTE)) return 0;
   if (afl_debug) printf("afl_remote_loop_next\n");
+  if (getenv(AFL_NO_REMOTE)) return 0;
   if (loop_count < afl_remote_skip_count) {
     loop_count++;
     return 0;
