@@ -45,7 +45,8 @@ u8* __afl_area_ptr = __afl_area_initial;
 
 void handle_sig(int sig) {
 
-  _exit(sig);
+  if (sig == 6 || sig == 11 || sig == 8) abort();
+  else _exit(sig);
 }
 
 void setup_signal_handlers(void) {
@@ -58,8 +59,6 @@ void setup_signal_handlers(void) {
   sigemptyset(&sa.sa_mask);
   sa.sa_handler = handle_sig;
 
-  sigaction(SIGTERM, &sa, NULL);
-  sigaction(SIGKILL, &sa, NULL);
   sigaction(SIGABRT, &sa, NULL);
   sigaction(SIGFPE, &sa, NULL);
   sigaction(SIGSEGV, &sa, NULL);

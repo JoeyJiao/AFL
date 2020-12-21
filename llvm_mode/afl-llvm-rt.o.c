@@ -436,7 +436,6 @@ int afl_remote_loop_start(void) {
 LOOP:
   if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
     perror("socket accept failed");
-    printf("addrlen=%d\n", addrlen);
     setup_afl_server();
     goto LOOP;
   }
