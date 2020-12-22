@@ -43,27 +43,6 @@ static int afl_sock_fd;
 u8  __afl_area_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
 
-void handle_sig(int sig) {
-
-  if (sig == 6 || sig == 11 || sig == 8) abort();
-  else _exit(sig);
-}
-
-void setup_signal_handlers(void) {
-  struct sigaction sa;
-
-  sa.sa_handler = NULL;
-  sa.sa_flags = SA_RESTART;
-  sa.sa_sigaction = NULL;
-
-  sigemptyset(&sa.sa_mask);
-  sa.sa_handler = handle_sig;
-
-  sigaction(SIGABRT, &sa, NULL);
-  sigaction(SIGFPE, &sa, NULL);
-  sigaction(SIGSEGV, &sa, NULL);
-}
-
 /* SHM setup. */
 
 void __afl_map_shm(void) {
@@ -116,7 +95,7 @@ void __afl_start_client(void) {
 
   if ((afl_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
     perror("socket create failed");
-    exit(EXIT_FAILURE);
+    _exit(EXIT_FAILURE);
   }
 }
 
@@ -143,11 +122,10 @@ __attribute__((constructor(5)))
 void afl_client_init(void) {
   static u8 init_done;
 
-  if (getenv(AFL_NO_REMOTE)) return;
   if (getenv(AFL_DEBUG)) afl_debug = 1;
+  if (getenv(AFL_NO_REMOTE)) return;
 
   atexit(afl_client_exit);
-  setup_signal_handlers();
 
   if (!init_done) {
 
@@ -158,8 +136,8 @@ void afl_client_init(void) {
 }
 
 void afl_client_continue(void) {
-  if (getenv(AFL_NO_REMOTE)) return;
   if (afl_debug) printf("afl_client_continue\n");
+  if (getenv(AFL_NO_REMOTE)) return;
   if (send(afl_sock_fd, "CONT", 4, 0) != 4) _exit(1);
 }
 
@@ -173,9 +151,7 @@ void afl_client_exit(void) {
 #ifdef __ANDROID__
   // AFL context
   char *id_str = getenv(SHM_ENV_VAR);
-  if (id_str)
-    if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
-  if (afl_debug) 
+  if (id_str || afl_debug)
     if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
 #endif
   

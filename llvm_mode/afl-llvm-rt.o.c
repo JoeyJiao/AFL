@@ -359,8 +359,28 @@ void setup_shm(void) {
 }
 
 void handle_sig(int sig) {
-  if (client_pid != -1)
+  if (client_pid != -1) {
+    // send trace_bits to client in case crash 
+    if (afl_debug) dprintf(2, "handle sig %d\n", sig);
+    if (getenv(AFL_NO_REMOTE)) return;
+
+    u8 tmp[4];
+
+    memset(tmp, 0, 4);
+    if (recv(afl_sock_fd, &tmp, 4, MSG_WAITALL) != 4) goto error;
+
+#ifdef __ANDROID__
+    if (shm_id != -1) {
+      if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
+    }
+#endif
+
+error:
+    close(afl_sock_fd);
+    close(sock_fd);
+
     kill(client_pid, sig);
+  }
 }
 
 void setup_signal_handlers(void) {
@@ -418,13 +438,14 @@ void setup_afl_server() {
   if (listen(sock_fd, 8) < 0) {
     perror("socket listen failed");
     close(sock_fd);
-    exit(EXIT_FAILURE);
+    _exit(EXIT_FAILURE);
   }
 }
 
 int afl_remote_loop_start(void) {
   if (afl_debug) printf("afl_remote_loop_start\n");
   if (getenv(AFL_NO_REMOTE)) return 0;
+
   if (loop_count < afl_remote_skip_count) return 0;
   if (loop_continue) {
     if (afl_debug) printf("afl_remote_loop_continue\n");
