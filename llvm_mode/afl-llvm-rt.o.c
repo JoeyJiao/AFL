@@ -361,13 +361,12 @@ void setup_shm(void) {
 void handle_sig(int sig) {
   if (client_pid != -1) {
     // send trace_bits to client in case crash 
-    if (afl_debug) dprintf(2, "handle sig %d\n", sig);
     if (getenv(AFL_NO_REMOTE)) return;
 
     u8 tmp[4];
 
     memset(tmp, 0, 4);
-    if (recv(afl_sock_fd, &tmp, 4, MSG_WAITALL) != 4) goto error;
+    if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
 
 #ifdef __ANDROID__
     if (shm_id != -1) {
@@ -491,7 +490,7 @@ int afl_remote_loop_next(void) {
   u8 tmp[4];
 
   memset(tmp, 0, 4);
-  if (recv(afl_sock_fd, &tmp, 4, MSG_WAITALL) != 4) goto error;
+  if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
 
   if (!memcmp(tmp, "CONT", 4)) {
     loop_continue = 1;

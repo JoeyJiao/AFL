@@ -146,7 +146,7 @@ void afl_client_exit(void) {
 
   memset(tmp, 0, 4);
   // phone server that I will exit now
-  if (send(afl_sock_fd, &tmp, 4, 0) != 4) _exit(1);
+  if (send(afl_sock_fd, tmp, 4, 0) != 4) _exit(1);
 
 #ifdef __ANDROID__
   // AFL context
