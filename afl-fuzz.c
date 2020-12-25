@@ -2661,7 +2661,10 @@ static u8 run_target(char** argv, u32 timeout) {
 
     kill_signal = WTERMSIG(status);
 
-    if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+    if (child_timed_out && kill_signal == SIGKILL) {
+      if (getenv("AFL_REMOTE_PROCESS")) return FAULT_CRASH;
+      return FAULT_TMOUT;
+    }
 
     return FAULT_CRASH;
 

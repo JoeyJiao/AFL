@@ -445,6 +445,9 @@ int afl_remote_loop_start(void) {
   if (afl_debug) printf("afl_remote_loop_start\n");
   if (getenv(AFL_NO_REMOTE)) return 0;
 
+  memset(__afl_area_ptr, 0, MAP_SIZE);
+  MEM_BARRIER();
+
   if (loop_count < afl_remote_skip_count) return 0;
   if (loop_continue) {
     if (afl_debug) printf("afl_remote_loop_continue\n");
@@ -504,11 +507,13 @@ int afl_remote_loop_next(void) {
 #endif
 
   close(afl_sock_fd);
+  MEM_BARRIER();
   return 0;
 
 error:
   close(afl_sock_fd);
   close(sock_fd);
+  MEM_BARRIER();
   return 1;
 }
 

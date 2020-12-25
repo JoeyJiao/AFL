@@ -151,8 +151,15 @@ void afl_client_exit(void) {
 #ifdef __ANDROID__
   // AFL context
   char *id_str = getenv(SHM_ENV_VAR);
-  if (id_str || afl_debug)
+  if (id_str || afl_debug) {
     if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
+    if (getenv("AFL_SAVE_TRACEBITS")) {
+      FILE *fp;
+      fp = fopen("trace_bits", "wb");
+      fwrite(__afl_area_ptr, MAP_SIZE, 1, fp);
+      fclose(fp);
+    }
+  }
 #endif
   
   close(afl_sock_fd);
