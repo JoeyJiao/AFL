@@ -370,6 +370,8 @@ void handle_sig(int sig) {
 
 #ifdef __ANDROID__
     if (shm_id != -1) {
+      if (!getenv("AFL_NO_MEM_BARRIER"))
+        MEM_BARRIER();
       if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
     }
 #endif
@@ -446,7 +448,8 @@ int afl_remote_loop_start(void) {
   if (getenv(AFL_NO_REMOTE)) return 0;
 
   memset(__afl_area_ptr, 0, MAP_SIZE);
-  MEM_BARRIER();
+  if (!getenv("AFL_NO_MEM_BARRIER"))
+    MEM_BARRIER();
 
   if (loop_count < afl_remote_skip_count) return 0;
   if (loop_continue) {
@@ -502,18 +505,18 @@ int afl_remote_loop_next(void) {
 
 #ifdef __ANDROID__
   if (shm_id != -1) {
+    if (!getenv("AFL_NO_MEM_BARRIER"))
+      MEM_BARRIER();
     if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
   }
 #endif
 
   close(afl_sock_fd);
-  MEM_BARRIER();
   return 0;
 
 error:
   close(afl_sock_fd);
   close(sock_fd);
-  MEM_BARRIER();
   return 1;
 }
 
