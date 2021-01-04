@@ -18,6 +18,7 @@ cc_defaults {
     "-DBIN_PATH=\"out/host/linux-x86/bin\"",
     "-DDOC_PATH=\"out/host/linux-x86/shared/doc/afl\"",
     "-D__USE_GNU",
+    "-D__aarch64__",
     "-g",
     "-O0",
     "-fno-omit-frame-pointer",

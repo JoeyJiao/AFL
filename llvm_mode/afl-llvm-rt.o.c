@@ -370,9 +370,18 @@ void handle_sig(int sig) {
 
 #ifdef __ANDROID__
     if (shm_id != -1) {
-      if (!getenv("AFL_NO_MEM_BARRIER"))
+      if (!getenv("AFL_NO_MEM_BARRIER")) {
         MEM_BARRIER();
+      }
       if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
+      if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
+      FILE *fp;
+      char* file = getenv("AFL_TRACE_BITS_FILE");
+      if (file) {
+        fp = fopen(file, "wb");
+        fwrite(__afl_area_ptr, MAP_SIZE, 1, fp);
+        fclose(fp);
+      }
     }
 #endif
 
@@ -385,20 +394,10 @@ error:
 }
 
 void setup_signal_handlers(void) {
-  struct sigaction sa;
-
-  sa.sa_handler = NULL;
-  sa.sa_flags = SA_RESTART;
-  sa.sa_sigaction = NULL;
-
-  sigemptyset(&sa.sa_mask);
-  sa.sa_handler = handle_sig;
-
-  sigaction(SIGABRT, &sa, NULL);
-  sigaction(SIGFPE, &sa, NULL);
-  sigaction(SIGSEGV, &sa, NULL);
-  sigaction(SIGTERM, &sa, NULL);
-  sigaction(SIGKILL, &sa, NULL);
+  signal(SIGABRT, handle_sig);
+  signal(SIGFPE, handle_sig);
+  signal(SIGSEGV, handle_sig);
+//  sigaction(SIGTERM, &sa, NULL);
   signal(SIGPIPE, SIG_IGN);
 }
 
@@ -448,8 +447,11 @@ int afl_remote_loop_start(void) {
   if (getenv(AFL_NO_REMOTE)) return 0;
 
   memset(__afl_area_ptr, 0, MAP_SIZE);
-  if (!getenv("AFL_NO_MEM_BARRIER"))
+  __afl_area_ptr[0] = 1;
+  __afl_prev_loc = 0;
+  if (!getenv("AFL_NO_MEM_BARRIER")) {
     MEM_BARRIER();
+  }
 
   if (loop_count < afl_remote_skip_count) return 0;
   if (loop_continue) {
@@ -459,11 +461,13 @@ int afl_remote_loop_start(void) {
   }
 
   unsigned int addrlen = sizeof(addr);
-LOOP:
+//LOOP:
   if ((afl_sock_fd=accept(sock_fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
     perror("socket accept failed");
-    setup_afl_server();
-    goto LOOP;
+    close(sock_fd);
+    _exit(1);
+//    setup_afl_server();
+//    goto LOOP;
   }
 
   if (recv(afl_sock_fd, &shm_id, 4, MSG_WAITALL) != 4) goto error;
@@ -505,11 +509,14 @@ int afl_remote_loop_next(void) {
 
 #ifdef __ANDROID__
   if (shm_id != -1) {
-    if (!getenv("AFL_NO_MEM_BARRIER"))
+    if (!getenv("AFL_NO_MEM_BARRIER")) {
       MEM_BARRIER();
+    }
     if (send(afl_sock_fd, __afl_area_ptr, MAP_SIZE, 0) != MAP_SIZE) goto error;
+    if (recv(afl_sock_fd, tmp, 4, MSG_WAITALL) != 4) goto error;
   }
 #endif
+//  __afl_area_ptr = __afl_area_initial;
 
   close(afl_sock_fd);
   return 0;

@@ -43,6 +43,13 @@ static int afl_sock_fd;
 u8  __afl_area_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
 
+void handle_sig(int sig) {
+  if (sig == SIGTERM) { // timeout from afl-fuzz
+    if (server_pid != -1)
+      kill(server_pid, sig);
+  }
+}
+
 /* SHM setup. */
 
 void __afl_map_shm(void) {
@@ -102,10 +109,11 @@ void __afl_start_client(void) {
 void afl_client_start(void) {
   if (getenv(AFL_NO_REMOTE)) return;
 
-RECONNECT:
+//RECONNECT:
   if (connect(afl_sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-    usleep(1000);
-    goto RECONNECT;
+      _exit(1);
+//    usleep(1000);
+//    goto RECONNECT;
   }
 
   if (send(afl_sock_fd, &shm_id, 4, 0) != 4) _exit(1);
@@ -118,6 +126,10 @@ RECONNECT:
 
 void afl_client_exit(void);
 
+void setup_signal_handlers(void) {
+  signal(SIGTERM, handle_sig);
+}
+
 __attribute__((constructor(5)))
 void afl_client_init(void) {
   static u8 init_done;
@@ -126,6 +138,7 @@ void afl_client_init(void) {
   if (getenv(AFL_NO_REMOTE)) return;
 
   atexit(afl_client_exit);
+  setup_signal_handlers();
 
   if (!init_done) {
 
@@ -153,16 +166,15 @@ void afl_client_exit(void) {
   char *id_str = getenv(SHM_ENV_VAR);
   if (id_str || afl_debug) {
     if (recv(afl_sock_fd, __afl_area_ptr, MAP_SIZE, MSG_WAITALL) != MAP_SIZE) _exit(1);
-    if (getenv("AFL_SAVE_TRACEBITS")) {
-      FILE *fp;
-      fp = fopen("trace_bits", "wb");
-      fwrite(__afl_area_ptr, MAP_SIZE, 1, fp);
-      fclose(fp);
-    }
+    if (send(afl_sock_fd, tmp, 4, 0) != 4) _exit(1);
   }
 #endif
   
   close(afl_sock_fd);
+
+#ifdef __ANDROID__
+  usleep(10000);
+#endif
   
   _exit(0);
 }
