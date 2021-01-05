@@ -19,6 +19,8 @@ cc_defaults {
     "-DDOC_PATH=\"out/host/linux-x86/shared/doc/afl\"",
     "-D__USE_GNU",
     "-D__aarch64__",
+    "-DDEBUG_BUILD",
+    "-U_FORTIFY_SOURCE",
     "-g",
     "-O0",
     "-fno-omit-frame-pointer",
