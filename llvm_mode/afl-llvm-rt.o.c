@@ -279,6 +279,18 @@ void __afl_manual_init(void) {
 
 __attribute__((constructor(CONST_PRIO))) void __afl_auto_init(void) {
 
+#ifdef __ANDROID__
+  // Disable handlers in linker/debuggerd, check include/debuggerd/handler.h
+  signal(SIGABRT, SIG_DFL);
+  signal(SIGBUS, SIG_DFL);
+  signal(SIGFPE, SIG_DFL);
+  signal(SIGILL, SIG_DFL);
+  signal(SIGSEGV, SIG_DFL);
+  signal(SIGSTKFLT, SIG_DFL);
+  signal(SIGSYS, SIG_DFL);
+  signal(SIGTRAP, SIG_DFL);
+#endif
+
   is_persistent = !!getenv(PERSIST_ENV_VAR);
 
   if (getenv(DEFER_ENV_VAR)) return;
